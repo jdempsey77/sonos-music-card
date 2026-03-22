@@ -9,95 +9,108 @@ alwaysApply: true
 
 ```typescript
 interface SonosMusicCardConfig {
-  ma_url?: string;         // Music Assistant base URL (default: auto-detected)
-  entity_prefix?: string;  // Sonos entity prefix (default: "media_player.")
+  entity_id?: string;  // Override MA entity for browse (default: auto-detect via mass_player_type)
 }
 ```
 
-## Music Assistant WebSocket API
+## Browse API — media_player/browse_media
 
-### mass/browse — Browse media libraries
+All browsing uses HA's standard `media_player/browse_media` WebSocket command.
+MA hooks into this via its `media_browser.py` integration.
 
-**Request:**
-```json
-{
-  "type": "mass/browse",
-  "item_type": "library",       // optional — "library" | "artist" | "album" | "track" | "playlist" | "radio"
-  "item_id": "",                // optional — ID of item to browse into
-  "provider_instance": ""       // optional — filter to specific provider (e.g., "plex", "ytmusic")
+### Root browse (no content params)
+```javascript
+hass.callWS({
+  type: 'media_player/browse_media',
+  entity_id: 'media_player.family_room',
+  // NO media_content_id or media_content_type for root
+})
+```
+
+Returns `{ children: [...] }` — root items include MA categories + HA sources.
+Filter to MA categories by title: Artists, Albums, Tracks, Playlists, Radio stations, etc.
+
+### Drill-down browse
+
+**CRITICAL: Use `item.media_class` as `media_content_type`, NOT `item.media_content_type`.**
+Exception: if `media_class === 'directory'`, use `item.media_content_type` instead.
+
+```javascript
+const drillType = item.media_class && item.media_class !== 'directory'
+  ? item.media_class
+  : item.media_content_type;
+
+hass.callWS({
+  type: 'media_player/browse_media',
+  entity_id: entityId,
+  media_content_id: item.media_content_id,
+  media_content_type: drillType,
+})
+```
+
+### Verified browse tree (from browse-test.html mapping)
+
+| Level | media_content_id | media_content_type for drill | media_class |
+|---|---|---|---|
+| Root category (Artists) | `artists` | `music_assistant` | `directory` |
+| Artist item | `library://artist/38` | `artist` | `artist` |
+| Album item | `plex--xxx://album//...` | `album` | `album` |
+| Track item | `plex--xxx://track//...` | `music` (playable) | `track` |
+
+### Browse response item shape
+```typescript
+interface BrowseMediaItem {
+  title: string;
+  media_content_id: string;
+  media_content_type: string;   // DO NOT use for drill-down — use media_class instead
+  media_class: string;          // USE THIS for drill-down type
+  can_play: boolean;
+  can_expand: boolean;
+  thumbnail?: string;           // MA image proxy URL (may need auth)
+  children?: BrowseMediaItem[]; // only on expanded results
 }
 ```
 
-**Response:**
-```json
-{
-  "items": [
-    {
-      "item_id": "string",
-      "name": "string",
-      "media_type": "artist|album|track|playlist|radio",
-      "uri": "string",
-      "image": { "url": "string" },
-      "provider": "string"
-    }
-  ]
-}
-```
+## Play API — media_player.play_media
 
-### mass/play_media — Play media on a player
-
-**Service call:**
-```json
-{
-  "domain": "mass",
-  "service": "play_media",
-  "service_data": {
-    "entity_id": "media_player.sonos_living_room",
-    "media_id": "plex://track/12345",
-    "media_type": "track|album|playlist|radio",
-    "enqueue": "play|next|add|replace"
-  }
-}
+```javascript
+hass.callService('media_player', 'play_media', {
+  entity_id: 'media_player.family_room',
+  media_content_id: item.media_content_id,
+  media_content_type: item.media_content_type,
+});
 ```
 
 ## Home Assistant Service Calls
 
 ### media_player.volume_set
-```json
-{
-  "domain": "media_player",
-  "service": "volume_set",
-  "service_data": {
-    "entity_id": "media_player.sonos_living_room",
-    "volume_level": 0.5
-  }
-}
+```javascript
+hass.callService('media_player', 'volume_set', {
+  entity_id: 'media_player.family_room',
+  volume_level: 0.5,  // 0.0 to 1.0
+});
 ```
 
 ### media_player.join — Group Sonos speakers
-```json
-{
-  "domain": "media_player",
-  "service": "join",
-  "service_data": {
-    "entity_id": "media_player.sonos_living_room",
-    "group_members": [
-      "media_player.sonos_kitchen",
-      "media_player.sonos_bedroom"
-    ]
-  }
-}
+```javascript
+hass.callService('media_player', 'join', {
+  entity_id: primarySpeaker,
+  group_members: allSelectedSpeakers,
+});
 ```
 
-### media_player.unjoin — Ungroup a Sonos speaker
-```json
-{
-  "domain": "media_player",
-  "service": "unjoin",
-  "service_data": {
-    "entity_id": "media_player.sonos_kitchen"
-  }
-}
+### media_player.unjoin — Ungroup a speaker
+```javascript
+hass.callService('media_player', 'unjoin', {
+  entity_id: speakerToRemove,
+});
+```
+
+### media_player.media_play_pause
+```javascript
+hass.callService('media_player', 'media_play_pause', {
+  entity_id: entityId,
+});
 ```
 
 ## MA Entity Detection
@@ -115,11 +128,11 @@ const maPlayers = Object.entries(hass.states)
 ```
 
 ### Known MA-managed Sonos entities (this HA instance)
-- `media_player.float`
-- `media_player.garage_2`
-- `media_player.office_2`
-- `media_player.family_room`
-- `media_player.basement_2`
+- `media_player.float` — Sonos Roam (portable)
+- `media_player.garage_2` — Garage
+- `media_player.office_2` — Office
+- `media_player.family_room` — Family Room (Arc)
+- `media_player.basement_2` — Basement
 
 Note: `media_player.living_room` and `media_player.bedroom` are **native Sonos integration**
 entities — they do NOT have `mass_player_type` and should not be used for MA API calls.
