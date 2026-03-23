@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MA Browse API Explorer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f0f1a; color: #d0d0ee; font-family: system-ui, monospace; padding: 16px; }
+  h1 { font-size: 18px; margin-bottom: 12px; color: #7b2fbe; }
+  h2 { font-size: 14px; margin: 16px 0 8px; color: #00c9a7; }
+  .connect-bar {
+    display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap;
+  }
+  input[type="text"] {
+    flex: 1; min-width: 200px; padding: 8px 12px; border-radius: 6px;
+    background: #1a1a2e; border: 1px solid #2a2a3e; color: #d0d0ee;
+    font-family: monospace; font-size: 13px;
+  }
+  button {
+    padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer;
+    font-size: 12px; font-weight: 600; font-family: system-ui;
+  }
+  .btn-connect { background: #7b2fbe; color: #fff; }
+  .btn-browse { background: #1a1a2e; color: #00c9a7; border: 1px solid #2a2a3e; }
+  .btn-browse:hover { background: #2a2a3e; }
+  .btn-back { background: #1a1a2e; color: #a064d8; border: 1px solid #2a2a3e; margin-bottom: 8px; }
+  .status { font-size: 12px; padding: 4px 0; }
+  .status.ok { color: #00c9a7; }
+  .status.err { color: #ff6b6b; }
+  .breadcrumb {
+    font-size: 11px; color: #5a5a7a; margin-bottom: 8px;
+  }
+  .breadcrumb span { cursor: pointer; }
+  .breadcrumb span:hover { color: #d0d0ee; }
+  .breadcrumb .current { color: #a064d8; cursor: default; }
+  .breadcrumb .sep { color: #3a3a5a; margin: 0 4px; }
+  .children {
+    display: flex; flex-direction: column; gap: 4px; margin: 8px 0;
+  }
+  .child-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px; border-radius: 6px; background: #1a1a2e;
+    border: 1px solid #2a2a3e;
+  }
+  .child-title { flex: 1; font-size: 13px; }
+  .child-meta { font-size: 10px; color: #5a5a7a; font-family: monospace; }
+  .child-badges { display: flex; gap: 4px; }
+  .badge {
+    font-size: 9px; padding: 2px 6px; border-radius: 4px;
+    background: #2a2a3e; color: #6b6b8a;
+  }
+  .badge.play { background: #0d1e1c; color: #00c9a7; }
+  .badge.expand { background: #1e1230; color: #a064d8; }
+  pre {
+    background: #1a1a2e; border: 1px solid #2a2a3e; border-radius: 8px;
+    padding: 12px; font-size: 11px; overflow-x: auto; white-space: pre-wrap;
+    word-break: break-all; max-height: 400px; overflow-y: auto;
+    color: #8a8aaa; margin: 8px 0;
+  }
+  .toggle-raw {
+    font-size: 11px; color: #5a5a7a; cursor: pointer; margin: 4px 0;
+    display: inline-block;
+  }
+  .toggle-raw:hover { color: #d0d0ee; }
+</style>
+</head>
+<body>
+
+<h1>MA Browse API Explorer</h1>
+
+<div class="connect-bar">
+  <input type="text" id="token" placeholder="Paste HA long-lived access token..." />
+  <button class="btn-connect" onclick="connect()">Connect</button>
+</div>
+<div id="status" class="status"></div>
+
+<div id="content"></div>
+
+<script>
+let ws = null;
+let msgId = 1;
+const pending = {};
+const history = []; // breadcrumb stack: [{title, contentId, contentType, result}]
+
+function setStatus(msg, ok) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status ' + (ok ? 'ok' : 'err');
+}
+
+function connect() {
+  const token = document.getElementById('token').value.trim();
+  if (!token) { setStatus('Enter a token first', false); return; }
+
+  setStatus('Connecting...');
+  ws = new WebSocket('wss://ha.dempsey5.com/api/websocket');
+
+  ws.onopen = () => setStatus('WebSocket open, authenticating...');
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+
+    if (msg.type === 'auth_required') {
+      ws.send(JSON.stringify({ type: 'auth', access_token: token }));
+      return;
+    }
+
+    if (msg.type === 'auth_ok') {
+      setStatus('Connected + authenticated. HA version: ' + msg.ha_version, true);
+      // Fire root browse
+      browseMedia(null, null, 'Root');
+      return;
+    }
+
+    if (msg.type === 'auth_invalid') {
+      setStatus('Auth failed: ' + msg.message, false);
+      return;
+    }
+
+    // Handle responses
+    if (msg.id && pending[msg.id]) {
+      const cb = pending[msg.id];
+      delete pending[msg.id];
+      if (msg.success) {
+        cb(null, msg.result);
+      } else {
+        cb(msg.error || { message: 'Unknown error' });
+      }
+    }
+  };
+
+  ws.onerror = () => setStatus('WebSocket error', false);
+  ws.onclose = () => setStatus('WebSocket closed', false);
+}
+
+function callWS(params) {
+  return new Promise((resolve, reject) => {
+    const id = msgId++;
+    pending[id] = (err, result) => err ? reject(err) : resolve(result);
+    ws.send(JSON.stringify({ id, ...params }));
+  });
+}
+
+async function browseMedia(contentId, contentType, title) {
+  const params = {
+    type: 'media_player/browse_media',
+    entity_id: 'media_player.family_room',
+  };
+  if (contentId) {
+    params.media_content_id = contentId;
+    params.media_content_type = contentType;
+  }
+
+  setStatus('Browsing: ' + (contentId || '(root)') + ' ...');
+
+  try {
+    const result = await callWS(params);
+    setStatus('Got result: ' + (result.title || '?') + ' (' + (result.children?.length || 0) + ' children)', true);
+
+    // Push to history
+    history.push({ title: title || result.title, contentId, contentType, result });
+
+    renderResult(result);
+  } catch (err) {
+    setStatus('Browse error: ' + (err.message || JSON.stringify(err)), false);
+    document.getElementById('content').innerHTML =
+      '<pre>' + escHtml(JSON.stringify(err, null, 2)) + '</pre>';
+  }
+}
+
+function goBack(index) {
+  // Trim history to index
+  history.length = index + 1;
+  const entry = history[index];
+  renderResult(entry.result);
+  setStatus('Back to: ' + entry.title, true);
+}
+
+function renderResult(result) {
+  const el = document.getElementById('content');
+  const children = result.children || [];
+
+  // Breadcrumb
+  let breadHtml = '<div class="breadcrumb">';
+  history.forEach((h, i) => {
+    if (i > 0) breadHtml += '<span class="sep">›</span>';
+    if (i === history.length - 1) {
+      breadHtml += '<span class="current">' + escHtml(h.title) + '</span>';
+    } else {
+      breadHtml += '<span onclick="goBack(' + i + ')">' + escHtml(h.title) + '</span>';
+    }
+  });
+  breadHtml += '</div>';
+
+  // Current item info
+  let infoHtml = '<h2>Current: ' + escHtml(result.title || '?') + '</h2>';
+  infoHtml += '<div class="child-meta">content_id: ' + escHtml(result.media_content_id || '(none)') +
+    ' | content_type: ' + escHtml(result.media_content_type || '(none)') +
+    ' | media_class: ' + escHtml(result.media_class || '(none)') +
+    ' | can_play: ' + result.can_play + ' | can_expand: ' + result.can_expand + '</div>';
+
+  // Raw JSON toggle
+  infoHtml += '<span class="toggle-raw" onclick="toggleRaw()">▸ Show raw JSON (parent only)</span>';
+  const parentJson = { ...result, children: '(' + children.length + ' items, expand below)' };
+  infoHtml += '<pre id="raw-parent" style="display:none">' + escHtml(JSON.stringify(parentJson, null, 2)) + '</pre>';
+
+  // Children
+  let childHtml = '<h2>Children (' + children.length + ')</h2><div class="children">';
+  children.forEach((child, i) => {
+    const badges = [];
+    if (child.can_expand) badges.push('<span class="badge expand">expandable</span>');
+    if (child.can_play) badges.push('<span class="badge play">playable</span>');
+
+    childHtml += '<div class="child-row">';
+    childHtml += '<div class="child-title">' + escHtml(child.title || '?') + '</div>';
+    childHtml += '<div class="child-meta">' +
+      'id: ' + escHtml(child.media_content_id || '') +
+      ' | type: ' + escHtml(child.media_content_type || '') +
+      ' | class: ' + escHtml(child.media_class || '') +
+      '</div>';
+    childHtml += '<div class="child-badges">' + badges.join('') + '</div>';
+
+    if (child.can_expand) {
+      childHtml += '<button class="btn-browse" onclick=\'browseChild(' + i + ', "auto")\'>Drill (auto) ›</button>';
+      childHtml += '<button class="btn-browse" onclick=\'browseChild(' + i + ', "class")\'>class</button>';
+      childHtml += '<button class="btn-browse" onclick=\'browseChild(' + i + ', "music_assistant")\'>ma</button>';
+      childHtml += '<button class="btn-browse" onclick=\'browseChild(' + i + ', "library")\'>library</button>';
+    }
+
+    childHtml += '</div>';
+  });
+  childHtml += '</div>';
+
+  // Full raw children JSON
+  childHtml += '<span class="toggle-raw" onclick="toggleRawChildren()">▸ Show full raw children JSON</span>';
+  childHtml += '<pre id="raw-children" style="display:none">' + escHtml(JSON.stringify(children, null, 2)) + '</pre>';
+
+  el.innerHTML = breadHtml + infoHtml + childHtml;
+
+  // Store children for drill buttons
+  window._currentChildren = children;
+}
+
+function browseChild(index, typeMode) {
+  const child = window._currentChildren[index];
+  if (!child) return;
+  let type;
+  if (typeMode === 'class') {
+    type = child.media_class;
+  } else if (typeMode === 'music_assistant' || typeMode === 'library') {
+    type = typeMode;
+  } else {
+    // auto: try media_class first, fall back to media_content_type
+    type = child.media_class || child.media_content_type;
+  }
+  console.log('Drill:', child.title, 'id:', child.media_content_id, 'using type:', type, '(mode:', typeMode + ')');
+  browseMedia(child.media_content_id, type, child.title);
+}
+
+function toggleRaw() {
+  const el = document.getElementById('raw-parent');
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+function toggleRawChildren() {
+  const el = document.getElementById('raw-children');
+  el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+function escHtml(str) {
+  return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+</script>
+
+</body>
+</html>
