@@ -1,4 +1,4 @@
-// Sonos Music Card v0.13.1
+// Sonos Music Card v0.13.2
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -18,6 +18,10 @@ let _jellyfinUrl = null;          // public, browser-facing (browse + images)
 let _jellyfinInternalUrl = null;  // speaker-facing base for stream URLs
 let _jellyfinToken = null;
 let _jellyfinUserId = null;
+// Jellyfin item id of the track we last started from Browse. Sonos doesn't
+// reflect Jellyfin cover art back through HA (entity_picture is null), so we
+// use this to source the Now Playing art ourselves. Cleared when idle.
+let _smcNowPlayingJfId = null;
 
 // GET against the Jellyfin API. Auth via api_key query param (not a custom
 // header) so the browser issues a simple CORS GET with no preflight.
@@ -60,6 +64,13 @@ function jfImageUrl(itemId, tag) {
 // most reliable container for Sonos over plain HTTP.
 function jfStreamUrl(itemId) {
   return `${_jellyfinInternalUrl}/Audio/${itemId}/stream.mp3?api_key=${encodeURIComponent(_jellyfinToken)}&audioCodec=mp3`;
+}
+
+// Full-size cover art for the currently-playing Jellyfin track (public base —
+// browser-facing). Used as a fallback when HA gives us no entity_picture.
+function jfNowPlayingArt() {
+  if (!_smcNowPlayingJfId || !_jellyfinUrl) return null;
+  return `${_jellyfinUrl}/Items/${_smcNowPlayingJfId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
 }
 
 // Build normalized browse rows for a navigation frame.
@@ -487,7 +498,7 @@ function buildNpInfo(id, state) {
     title: a.media_title || 'Unknown',
     artist: a.media_artist || '',
     album: a.media_album_name || '',
-    art: smcResolveImage(a.entity_picture),
+    art: smcResolveImage(a.entity_picture) || jfNowPlayingArt(),
     isPlaying: state.state === 'playing',
     isExternal: isExternalSource(state),
     source: a.source || null,
@@ -552,6 +563,8 @@ function getNowPlaying(hass, selectedSpeakers) {
     const state = hass.states[id];
     if (state && hasMediaContext(state)) return buildNpInfo(id, state);
   }
+  // Nothing playing/paused anywhere — player is idle, drop the stored art id.
+  _smcNowPlayingJfId = null;
   return null;
 }
 
@@ -687,6 +700,9 @@ function BrowseView({ hass, selectedSpeakers }) {
         media_content_id: jfStreamUrl(ids[0]),
         media_content_type: 'music',
       });
+      // Remember the track we started so Now Playing can source its cover art
+      // from Jellyfin (HA reports no entity_picture for Sonos URL playback).
+      _smcNowPlayingJfId = ids[0];
     } catch (err) {
       console.error('[smc] play failed:', err);
       return;
