@@ -1,4 +1,4 @@
-// Sonos Music Card v0.6.0
+// Sonos Music Card v0.12.2
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos via Music Assistant
 
 import { h, render } from 'https://esm.sh/preact@10';
@@ -7,29 +7,62 @@ import htm from 'https://esm.sh/htm@3';
 
 const html = htm.bind(h);
 
+// ── Music Assistant config ─────────────────────────────────────
+const MA_ENTRY_ID = '01KMBK5ZVGF4V016KQG8ZGX9NK';
+
+function getProvider(uri = '') {
+  if (uri.startsWith('ytmusic--')) return 'ytm';
+  if (uri.startsWith('plex--'))    return 'plex';
+  if (uri.startsWith('library://')) return 'library';
+  return 'unknown';
+}
+
+function getProviderBadge(uri = '') {
+  const p = getProvider(uri);
+  if (p === 'ytm')  return { label: 'YTM',  color: '#ef4444', bg: '#2d0a0a' };
+  if (p === 'plex') return { label: 'PLEX', color: '#4ade80', bg: '#0a2d0a' };
+  return null;
+}
+
+function dedupeByName(items) {
+  const seen = new Set();
+  return items.filter(item => {
+    const key = item.name.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function smcResolveImage(url) {
+  if (!url) return null;
+  if (url.startsWith('http')) return url;
+  return `${location.origin}${url}`;
+}
+
 // ── Theme tokens ────────────────────────────────────────────────
 const THEME = {
-  base: '#0f0f1a',
-  surface: '#1a1a2e',
-  border: '#2a2a3e',
-  primary: '#7b2fbe',
-  primaryBg: '#1e1230',
-  primaryLight: '#e8d5ff',
-  accent: '#00c9a7',
-  accentBg: '#0d1e1c',
-  accentDark: '#04342c',
-  text: '#d0d0ee',
-  textBright: '#f0e8ff',
-  textSpeaker: '#c8c8e8',
-  muted: '#6b6b8a',
-  statusMuted: '#5a5a7a',
-  statusSelected: '#a064d8',
-  chevron: '#3a3a5a',
-  placeholder: '#3a3a5a',
-  pillInactive: '#1e1e30',
-  miniPlayerBg: '#1a0e2e',
-  navBg: '#0a0a14',
-  error: '#ff6b6b',
+  base: '#111111',
+  surface: '#1c1c1c',
+  border: '#2e2e2e',
+  primary: '#3b82f6',
+  primaryBg: '#0f1f3d',
+  primaryLight: '#bfdbfe',
+  accent: '#14b8a6',
+  accentBg: '#0d1f1d',
+  accentDark: '#042f2a',
+  text: '#e5e5e5',
+  textBright: '#ffffff',
+  textSpeaker: '#d4d4d4',
+  muted: '#737373',
+  statusMuted: '#525252',
+  statusSelected: '#93c5fd',
+  chevron: '#404040',
+  placeholder: '#404040',
+  pillInactive: '#1c1c1c',
+  miniPlayerBg: '#161616',
+  navBg: '#0a0a0a',
+  error: '#ef4444',
   radiusCard: '12px',
   radiusEl: '8px',
   font: 'system-ui, -apple-system, sans-serif',
@@ -62,6 +95,8 @@ const cardStyles = `
     border: 1px solid ${THEME.border};
     border-radius: ${THEME.radiusCard};
     min-height: 400px;
+    height: 600px;
+    max-height: 80vh;
     display: flex;
     flex-direction: column;
     overflow: hidden;
@@ -72,52 +107,70 @@ const cardStyles = `
     overflow-y: auto;
     padding: 20px 16px;
     padding-bottom: 60px;
+    min-height: 0;
   }
   .smc-header {
     font-size: 14px; font-weight: 600; color: ${THEME.muted};
     text-transform: uppercase; letter-spacing: 1px; margin: 0 0 16px 4px;
   }
 
-  /* ── Speaker grid ── */
-  .smc-speaker-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-    gap: 12px;
+  /* ── Speaker checkbox list ── */
+  .smc-spk-header {
+    display: flex; align-items: center;
+    justify-content: space-between;
+    padding: 8px 14px 4px;
   }
-  .smc-speaker {
+  .smc-spk-title {
+    font-size: 10px; color: ${THEME.muted};
+    text-transform: uppercase; letter-spacing: 0.1em;
+  }
+  .smc-spk-quick {
+    display: flex; gap: 6px; font-size: 10px; cursor: pointer;
+  }
+  .smc-spk-quick span:first-child { color: ${THEME.primary}; }
+  .smc-spk-group-label {
+    padding: 6px 14px 2px;
+    font-size: 9px; color: #404040;
+    text-transform: uppercase; letter-spacing: 0.12em;
+  }
+  .smc-spk-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 14px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .smc-spk-row:hover { background: #161616; }
+  .smc-spk-row.selected { background: #0f1f3d; }
+  .smc-chk {
+    width: 18px; height: 18px; border-radius: 4px;
+    border: 1.5px solid ${THEME.border};
+    background: ${THEME.surface};
+    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px; font-weight: 700;
+  }
+  .smc-chk.checked {
+    background: ${THEME.primary};
+    border-color: ${THEME.primary};
+    color: white;
+  }
+  .smc-spk-icon {
+    width: 32px; height: 32px; border-radius: 6px;
     background: ${THEME.surface}; border: 1px solid ${THEME.border};
-    border-radius: ${THEME.radiusCard}; padding: 16px 14px; cursor: pointer;
-    transition: border-color 0.15s, background 0.15s;
-    display: flex; flex-direction: column; gap: 8px;
-    user-select: none; -webkit-tap-highlight-color: transparent;
+    flex-shrink: 0; display: flex; align-items: center;
+    justify-content: center; font-size: 11px; color: #404040;
   }
-  .smc-speaker:active { transform: scale(0.97); }
-  .smc-speaker.selected { border-color: ${THEME.primary}; background: ${THEME.primaryBg}; }
-  .smc-speaker.grouped { border-color: ${THEME.accent}; background: ${THEME.accentBg}; }
-  .smc-speaker-name { font-size: 12px; font-weight: 500; color: ${THEME.textSpeaker}; margin: 0; display: flex; align-items: center; gap: 6px; }
-  .smc-grouped-badge {
-    font-size: 8px; padding: 1px 5px; border-radius: 4px;
-    background: ${THEME.accentBg}; color: ${THEME.accent}; border: 1px solid ${THEME.accent};
-    text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;
+  .smc-spk-info { flex: 1; min-width: 0; }
+  .smc-spk-name {
+    font-size: 13px; color: ${THEME.text};
+    margin: 0; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
   }
-  .smc-speaker-status {
-    font-size: 10px; color: ${THEME.statusMuted}; margin: 0;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-  }
-  .smc-speaker.selected .smc-speaker-status { color: ${THEME.statusSelected}; }
-  .smc-speaker.grouped .smc-speaker-status { color: ${THEME.accent}; }
-  .smc-speaker-volume { display: flex; align-items: center; gap: 4px; font-size: 10px; color: ${THEME.statusMuted}; margin-top: 2px; }
-  .smc-speaker.selected .smc-speaker-volume { color: ${THEME.statusSelected}; }
-  .smc-speaker.grouped .smc-speaker-volume { color: ${THEME.accent}; }
-  .smc-speaker-vol-slider {
-    width: 100%; height: 3px; -webkit-appearance: none; appearance: none;
-    background: ${THEME.border}; border-radius: 2px; outline: none;
-    cursor: pointer; margin-top: 4px;
-  }
-  .smc-speaker-vol-slider::-webkit-slider-thumb {
-    -webkit-appearance: none; width: 10px; height: 10px;
-    border-radius: 50%; background: ${THEME.primary}; cursor: pointer;
-  }
+  .smc-spk-name.muted { color: ${THEME.muted}; }
+  .smc-spk-sub { font-size: 10px; color: ${THEME.muted}; margin: 2px 0 0; }
+  .smc-spk-sub.playing { color: ${THEME.primary}; }
+  .smc-spk-sub.off { color: #404040; }
+  .smc-spk-vol { font-size: 10px; color: ${THEME.muted}; flex-shrink: 0; }
+  .smc-spk-divider { height: 1px; background: #1a1a1a; margin: 4px 14px; }
 
   /* ── Group bar ── */
   .smc-group-bar {
@@ -218,7 +271,7 @@ const cardStyles = `
   .smc-mini-btn:active { opacity: 0.7; }
 
   /* ── Now Playing ── */
-  .np-scroll { flex: 1; overflow-y: auto; padding-bottom: 60px; }
+  .np-scroll { flex: 1; overflow-y: auto; padding-bottom: 60px; min-height: 0; }
   .np-art-container {
     position: relative; width: 100%; height: 240px;
     background: ${THEME.surface}; overflow: hidden;
@@ -331,10 +384,152 @@ const cardStyles = `
   }
 
   /* ── Tab visibility ── */
-  .smc-tab-panel { display: flex; flex-direction: column; flex: 1; overflow: hidden; }
+  .smc-tab-panel { display: flex; flex-direction: column; flex: 1; overflow: hidden; min-height: 0; }
   .smc-tab-panel.hidden { display: none; }
 
   .smc-error { color: ${THEME.error}; font-size: 13px; text-align: center; padding: 20px; }
+
+  /* ── Browse mode toggle ── */
+  .smc-mode-toggle {
+    display: flex; gap: 8px; margin-bottom: 14px;
+  }
+  .smc-mode-pill {
+    flex: 1; padding: 10px 12px; border-radius: ${THEME.radiusEl};
+    font-size: 12px; font-weight: 600; text-align: center;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
+    transition: background 0.15s, border-color 0.15s, color 0.15s;
+    border: 1px solid ${THEME.border}; background: ${THEME.surface}; color: ${THEME.muted};
+  }
+  .smc-mode-pill.active { background: ${THEME.primaryBg}; border-color: ${THEME.primary}; color: #93c5fd; }
+
+  /* ── Search results ── */
+  .smc-search-placeholder {
+    text-align: center; padding: 40px 20px; color: ${THEME.muted}; font-size: 13px;
+  }
+  .smc-search-section { margin-bottom: 8px; }
+  .smc-browse-thumb {
+    width: 38px; height: 38px; border-radius: 6px;
+    object-fit: cover; flex-shrink: 0;
+  }
+  .smc-provider-badge {
+    font-size: 8px; font-weight: 700; padding: 2px 5px;
+    border-radius: 4px; flex-shrink: 0; letter-spacing: 0.5px;
+  }
+
+  /* ── Recently played ── */
+  .smc-recent-row {
+    display: flex; gap: 10px; overflow-x: auto; padding: 0 0 12px;
+    scrollbar-width: none; -ms-overflow-style: none;
+  }
+  .smc-recent-row::-webkit-scrollbar { display: none; }
+  .smc-recent-tile {
+    flex-shrink: 0; width: 72px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .smc-recent-art {
+    width: 72px; height: 72px; border-radius: 6px;
+    object-fit: cover; background: ${THEME.surface}; display: block;
+  }
+  .smc-recent-art-placeholder {
+    width: 72px; height: 72px; border-radius: 6px;
+    background: ${THEME.surface}; display: flex;
+    align-items: center; justify-content: center;
+    color: ${THEME.chevron}; font-size: 20px;
+  }
+  .smc-recent-title {
+    font-size: 10px; color: ${THEME.text}; margin: 4px 0 0;
+    overflow: hidden; text-overflow: ellipsis;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  }
+
+  /* ── Context play buttons ── */
+  .smc-context-buttons {
+    display: flex; gap: 8px; margin-bottom: 14px;
+  }
+  .smc-context-btn {
+    flex: 1; padding: 10px 12px; border-radius: ${THEME.radiusEl};
+    font-size: 12px; font-weight: 600; text-align: center;
+    cursor: pointer; border: none; -webkit-tap-highlight-color: transparent;
+  }
+  .smc-context-btn:active { opacity: 0.85; }
+  .smc-context-btn.primary { background: ${THEME.primary}; color: #fff; }
+  .smc-context-btn.secondary { background: ${THEME.surface}; color: ${THEME.text}; border: 1px solid ${THEME.border}; }
+
+  /* ── Home screen ── */
+  .smc-home-section { margin-bottom: 20px; }
+  .smc-home-section-header {
+    display: flex; align-items: center;
+    justify-content: space-between; margin-bottom: 8px;
+  }
+  .smc-home-section-title {
+    font-size: 10px; color: ${THEME.statusMuted};
+    text-transform: uppercase; letter-spacing: 0.1em;
+  }
+  .smc-home-refresh {
+    background: none; border: none; color: ${THEME.muted};
+    cursor: pointer; font-size: 14px; padding: 2px 4px;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .smc-home-refresh:active { opacity: 0.6; }
+  .smc-home-tiles {
+    display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px;
+    scrollbar-width: none; -ms-overflow-style: none;
+  }
+  .smc-home-tiles::-webkit-scrollbar { display: none; }
+  .smc-home-tile {
+    flex-shrink: 0; width: 72px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .smc-home-tile-art {
+    width: 72px; height: 72px; border-radius: 8px;
+    background: ${THEME.surface}; border: 1px solid ${THEME.border};
+    object-fit: cover; display: block; margin-bottom: 5px;
+  }
+  .smc-home-tile-placeholder {
+    width: 72px; height: 72px; border-radius: 8px;
+    background: ${THEME.surface}; border: 1px solid ${THEME.border};
+    display: flex; align-items: center; justify-content: center;
+    color: ${THEME.chevron}; font-size: 20px; margin-bottom: 5px;
+  }
+  .smc-home-tile-name {
+    font-size: 10px; color: ${THEME.muted};
+    text-align: center; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+  }
+
+  /* ── Context menu ── */
+  .smc-more-btn {
+    width: 28px; height: 28px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 6px; color: ${THEME.muted};
+    font-size: 13px; letter-spacing: 1px;
+    flex-shrink: 0; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .smc-more-btn:hover { background: ${THEME.surface}; color: ${THEME.text}; }
+  .smc-ctx-menu {
+    background: ${THEME.surface};
+    border: 1px solid ${THEME.border};
+    border-radius: 8px;
+    margin: 0 12px 4px 58px;
+    overflow: hidden;
+  }
+  .smc-ctx-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; font-size: 12px;
+    color: ${THEME.text}; cursor: pointer;
+    border-bottom: 1px solid #1a1a1a;
+  }
+  .smc-ctx-item:last-child { border-bottom: none; }
+  .smc-ctx-item:hover { background: #252525; }
+  .smc-ctx-item.primary { color: #93c5fd; }
+  .smc-ctx-item.green { color: #86efac; }
+  .smc-ctx-item.muted { color: ${THEME.muted}; }
+  .smc-ctx-icon {
+    width: 14px; text-align: center;
+    font-size: 11px; flex-shrink: 0; color: inherit;
+  }
+  .smc-ctx-divider { height: 1px; background: #1a1a1a; }
 `;
 
 // ── Helpers ─────────────────────────────────────────────────────
@@ -367,6 +562,8 @@ function buildNpInfo(id, state) {
       ? (a.entity_picture.startsWith('http') ? a.entity_picture : `${location.origin}${a.entity_picture}`)
       : null,
     isPlaying: state.state === 'playing',
+    isExternal: isExternalSource(state),
+    source: a.source || null,
     duration,
     position,
     positionUpdatedAt: a.media_position_updated_at,
@@ -375,15 +572,22 @@ function buildNpInfo(id, state) {
   };
 }
 
+function isExternalSource(state) {
+  if (!state) return false;
+  const source = state.attributes?.source;
+  return state.state === 'playing' && source && source !== 'Music Assistant Queue';
+}
+
 function hasMediaContext(state) {
   if (!state) return false;
+  if (isExternalSource(state)) return false;
   if (state.state === 'playing' || state.state === 'paused') return true;
   // Sonos goes idle on pause but keeps media_title — treat as paused
   // Exception: position=0 + duration>0 means track ended naturally
   if (state.state === 'idle' && state.attributes?.media_title) {
     const pos = state.attributes.media_position || 0;
     const dur = state.attributes.media_duration || 0;
-    if (dur > 0 && pos === 0) return false;
+    if (dur > 0 && (pos === 0 || pos >= dur)) return false;
     return true;
   }
   return false;
@@ -427,79 +631,123 @@ function formatTime(s) {
   return `${m}:${sec < 10 ? '0' : ''}${sec}`;
 }
 
-// ── Speaker Card ────────────────────────────────────────────────
-let _volTimer = null;
-function SpeakerCard({ entityId, state, isSelected, isGrouped, haGrouped, onTap, hass }) {
-  const info = getSpeakerInfo(entityId, state);
-  const cls = `smc-speaker${isSelected ? ' selected' : ''}${isGrouped ? ' grouped' : ''}`;
-  const showSlider = isSelected || isGrouped;
+// ── Speaker type detection ──────────────────────────────────────
+const SONOS_IDS = ['office_2', 'family_room', 'basement_2', 'garage_2', 'float'];
+function getSpeakerType(entityId) {
+  return SONOS_IDS.some(s => entityId.includes(s)) ? 'sonos' : 'google';
+}
 
-  const handleVol = useCallback((e) => {
-    e.stopPropagation();
-    const val = parseInt(e.target.value);
-    clearTimeout(_volTimer);
-    _volTimer = setTimeout(() => {
-      if (hass) hass.callService('media_player', 'volume_set', { entity_id: entityId, volume_level: val / 100 });
-    }, 300);
-  }, [hass, entityId]);
+// ── Speaker Row ─────────────────────────────────────────────────
+function SpeakerRow({ entityId, hass, selected, onToggle }) {
+  const state = hass.states[entityId];
+  const name = state?.attributes?.friendly_name || entityId.replace('media_player.', '');
+  const isPlaying = state?.state === 'playing';
+  const isGrouped = (state?.attributes?.group_members?.length || 0) > 1;
+  const isOff = state?.state === 'off';
+  const vol = state?.attributes?.volume_level;
+  const volPct = vol != null ? `${Math.round(vol * 100)}%` : '';
+  const title = state?.attributes?.media_title;
+
+  let subtext = '';
+  if (isOff) subtext = 'Off';
+  else if (isPlaying && title) subtext = `Playing \u00b7 ${title}`;
+  else if (isGrouped) subtext = 'Grouped';
+  else subtext = 'Idle';
 
   return html`
-    <div class=${cls} onClick=${() => onTap(entityId)}>
-      <p class="smc-speaker-name">${info.name}${haGrouped && !isGrouped && !isSelected
-        ? html`<span class="smc-grouped-badge">grouped</span>` : ''}</p>
-      <p class="smc-speaker-status">${info.status}</p>
-      ${info.volume != null && html`
-        <div class="smc-speaker-volume"><${IconVolume} /><span>${info.volume}%</span></div>
-      `}
-      ${showSlider && info.volume != null && html`
-        <input type="range" class="smc-speaker-vol-slider" min="0" max="100" value=${info.volume}
-          onClick=${(e) => e.stopPropagation()}
-          onInput=${handleVol}
-          style=${`background: linear-gradient(to right, ${THEME.primary} ${info.volume}%, ${THEME.border} ${info.volume}%)`}
-        />
-      `}
+    <div class=${`smc-spk-row${selected ? ' selected' : ''}`}
+         onClick=${() => onToggle(entityId)}>
+      <div class=${`smc-chk${selected ? ' checked' : ''}`}>
+        ${selected ? '\u2713' : ''}
+      </div>
+      <div class="smc-spk-icon">
+        ${getSpeakerType(entityId) === 'google' ? 'G' : '\u266A'}
+      </div>
+      <div class="smc-spk-info">
+        <p class=${`smc-spk-name${!selected && !isPlaying ? ' muted' : ''}`}>
+          ${name}
+        </p>
+        <p class=${`smc-spk-sub${isPlaying ? ' playing' : isOff ? ' off' : ''}`}>
+          ${subtext}
+        </p>
+      </div>
+      ${volPct && html`<span class="smc-spk-vol">${volPct}</span>`}
     </div>
   `;
 }
 
 // ── Speakers View ───────────────────────────────────────────────
-function SpeakersView({ hass, selected, onSelect, onGroup, isPlaying }) {
+function SpeakersView({ hass, selected, onSelect, onGroup, isPlaying, includePlayers, excludePlayers }) {
   const maPlayers = useMemo(() => {
     if (!hass) return [];
-    return Object.entries(hass.states)
-      .filter(([id, state]) => id.startsWith('media_player.') && state.attributes.mass_player_type === 'player')
-      .map(([id]) => id).sort();
-  }, [hass]);
+    if (includePlayers?.length) {
+      return includePlayers.filter(id => hass.states[id]).sort();
+    }
+    let players = Object.entries(hass.states)
+      .filter(([id, state]) => {
+        if (!id.startsWith('media_player.')) return false;
+        if (state.attributes?.mass_player_type !== 'player') return false;
+        const name = state.attributes?.friendly_name || '';
+        if (name.endsWith('+')) return false;
+        if (name.endsWith('(Cast)')) return false;
+        return true;
+      })
+      .map(([id]) => id);
+    if (excludePlayers?.length) {
+      players = players.filter(id => !excludePlayers.includes(id));
+    }
+    return players.sort();
+  }, [hass, includePlayers, excludePlayers]);
+
   const selectedNames = useMemo(() =>
     selected.map(id => hass?.states[id]?.attributes?.friendly_name || id.replace('media_player.', '')),
   [selected, hass]);
 
-  // Pre-compute all grouped entity IDs across all speakers
-  const groupedEntityIds = useMemo(() => {
-    const grouped = new Set();
-    if (!hass) return grouped;
-    Object.entries(hass.states).forEach(([id, s]) => {
-      const members = s.attributes?.group_members || [];
-      if (members.length > 1) members.forEach(m => grouped.add(m));
+  // Group by type
+  const { sonos, google } = useMemo(() => {
+    const s = [], g = [];
+    maPlayers.forEach(id => {
+      if (getSpeakerType(id) === 'sonos') s.push(id);
+      else g.push(id);
     });
-    return grouped;
-  }, [hass]);
+    return { sonos: s, google: g };
+  }, [maPlayers]);
+
+  const selectAll = useCallback(() => {
+    maPlayers.forEach(id => { if (!selected.includes(id)) onSelect(id); });
+  }, [maPlayers, selected, onSelect]);
+  const selectNone = useCallback(() => {
+    selected.forEach(id => onSelect(id));
+  }, [selected, onSelect]);
 
   return html`
     <div class="smc-content">
-      <p class="smc-header">Speakers</p>
       ${maPlayers.length === 0 && html`<p class="smc-error">No Music Assistant speakers found</p>`}
-      <div class="smc-speaker-grid">
-        ${maPlayers.map(id => {
-          const state = hass.states[id];
-          if (!state) return null;
-          const idx = selected.indexOf(id);
-          const haGrouped = groupedEntityIds.has(id);
-          return html`<${SpeakerCard} key=${id} entityId=${id} state=${state}
-            isSelected=${idx === 0} isGrouped=${idx > 0} haGrouped=${haGrouped}
-            onTap=${onSelect} hass=${hass} />`;
-        })}
-      </div>
+      ${maPlayers.length > 0 && html`
+        <div class="smc-spk-header">
+          <span class="smc-spk-title">Select speakers</span>
+          <div class="smc-spk-quick">
+            <span onClick=${selectAll}>All</span>
+            <span style="color:${THEME.border}">\u00b7</span>
+            <span onClick=${selectNone} style="color:${THEME.muted}">None</span>
+          </div>
+        </div>
+        ${sonos.length > 0 && html`
+          <div class="smc-spk-group-label">Sonos</div>
+          ${sonos.map(id => html`
+            <${SpeakerRow} key=${id} entityId=${id} hass=${hass}
+              selected=${selected.includes(id)} onToggle=${onSelect} />
+          `)}
+        `}
+        ${sonos.length > 0 && google.length > 0 && html`<div class="smc-spk-divider" />`}
+        ${google.length > 0 && html`
+          <div class="smc-spk-group-label">Google</div>
+          ${google.map(id => html`
+            <${SpeakerRow} key=${id} entityId=${id} hass=${hass}
+              selected=${selected.includes(id)} onToggle=${onSelect} />
+          `)}
+        `}
+      `}
     </div>
     ${selected.length >= 2 && html`
       <div class="smc-group-bar" onClick=${onGroup}>
@@ -513,19 +761,366 @@ function SpeakersView({ hass, selected, onSelect, onGroup, isPlaying }) {
   `;
 }
 
+// ── Artist grouping (collapse feat. variants) ──────────────────
+function getBaseArtist(title) {
+  const match = title.match(/^(.+?)(?:\s+feat\.?\s|\s+featuring\s|\s+ft\.?\s)/i);
+  return match ? match[1].trim() : null;
+}
+
+function groupArtists(items) {
+  const baseNames = new Set(items.map(i => i.title));
+  const baseMap = new Map();
+  const standalones = [];
+
+  items.forEach(item => {
+    const base = getBaseArtist(item.title);
+    if (base) {
+      if (!baseMap.has(base)) baseMap.set(base, { baseItem: null, variants: [] });
+      baseMap.get(base).variants.push(item);
+    } else {
+      standalones.push(item);
+    }
+  });
+
+  // Link standalone entries to their variant groups
+  standalones.forEach(item => {
+    if (baseMap.has(item.title)) {
+      baseMap.get(item.title).baseItem = item;
+    }
+  });
+
+  const result = [];
+  const handledBases = new Set();
+
+  // Build sorted list: standalones that have groups become group entries
+  standalones.forEach(item => {
+    if (baseMap.has(item.title)) {
+      handledBases.add(item.title);
+      const g = baseMap.get(item.title);
+      result.push({ type: 'group', base: item.title, baseItem: g.baseItem, variants: g.variants });
+    } else {
+      result.push({ type: 'single', item });
+    }
+  });
+
+  // Groups with no standalone base entry
+  baseMap.forEach((g, base) => {
+    if (!handledBases.has(base)) {
+      result.push({ type: 'group', base, baseItem: null, variants: g.variants });
+    }
+  });
+
+  result.sort((a, b) => {
+    const nameA = a.type === 'single' ? a.item.title : a.base;
+    const nameB = b.type === 'single' ? b.item.title : b.base;
+    return nameA.localeCompare(nameB);
+  });
+  return result;
+}
+
+// ── Track Row with Context Menu ─────────────────────────────────
+function TrackRow({ item, hass, entityId, onPlay, openMenuId, setOpenMenuId }) {
+  const artistName = item.artists?.[0]?.name || item.artist || 'this artist';
+  const isMenuOpen = openMenuId === (item.uri || item.media_content_id);
+  const menuId = item.uri || item.media_content_id;
+
+  const handleMore = useCallback((e) => {
+    e.stopPropagation();
+    setOpenMenuId(prev => prev === menuId ? null : menuId);
+  }, [menuId, setOpenMenuId]);
+
+  const doAction = useCallback(async (action, e) => {
+    if (e) e.stopPropagation();
+    setOpenMenuId(null);
+    if (!hass || !entityId) return;
+    const mediaId = item.uri || item.media_content_id;
+    const mediaType = item.media_type || item.media_content_type || 'track';
+    try {
+      if (action === 'play') {
+        await hass.callService('music_assistant', 'play_media',
+          { media_id: mediaId, media_type: mediaType, radio_mode: false },
+          { entity_id: entityId });
+      } else if (action === 'next' || action === 'queue') {
+        // Check if speaker is playing — if idle, fall back to 'play' enqueue mode
+        const spkState = hass.states[entityId]?.state;
+        const isActive = spkState === 'playing' || spkState === 'paused';
+        const enqueueMode = isActive ? (action === 'next' ? 'next' : 'add') : 'play';
+        await hass.callService('music_assistant', 'play_media',
+          { media_id: mediaId, media_type: mediaType, enqueue: enqueueMode, radio_mode: false },
+          { entity_id: entityId });
+      } else if (action === 'radio') {
+        const artistUri = item.artists?.[0]?.uri || mediaId;
+        await hass.callService('music_assistant', 'play_media',
+          { media_id: artistUri, media_type: 'artist', radio_mode: true },
+          { entity_id: entityId });
+      }
+    } catch (err) { console.error('[smc] Context action failed:', err); }
+  }, [hass, entityId, item, setOpenMenuId]);
+
+  const title = item.name || item.title || 'Unknown';
+  const subtitle = item.artists?.[0]?.name || item.artist || 'track';
+  const image = item.image || (item.thumbnail ? (item.thumbnail.startsWith('http') ? item.thumbnail : location.origin + item.thumbnail) : null);
+  const badge = item.uri ? getProviderBadge(item.uri) : null;
+
+  return html`
+    <div>
+      <div class="smc-browse-row" onClick=${() => onPlay ? onPlay() : doAction('play')}>
+        ${image
+          ? html`<img class="smc-browse-thumb" src=${image} alt="" />`
+          : html`<div class="smc-browse-thumb-placeholder">\u{266A}</div>`
+        }
+        <div class="smc-browse-info">
+          <p class="smc-browse-title">${title}</p>
+          <p class="smc-browse-subtitle">${subtitle}</p>
+        </div>
+        ${badge && html`
+          <span class="smc-provider-badge" style=${`color:${badge.color}; border:1px solid ${badge.color}; background:${badge.bg};`}>
+            ${badge.label}
+          </span>
+        `}
+        <div class="smc-more-btn" onClick=${handleMore}>\u22EF</div>
+      </div>
+      ${isMenuOpen && html`
+        <div class="smc-ctx-menu" onClick=${(e) => e.stopPropagation()}>
+          <div class="smc-ctx-item primary" onClick=${(e) => doAction('play', e)}>
+            <span class="smc-ctx-icon">\u25B6</span> Play now
+          </div>
+          <div class="smc-ctx-item" onClick=${(e) => doAction('next', e)}>
+            <span class="smc-ctx-icon">\u00BB</span> Play next
+          </div>
+          <div class="smc-ctx-item" onClick=${(e) => doAction('queue', e)}>
+            <span class="smc-ctx-icon">+</span> Add to queue
+          </div>
+          <div class="smc-ctx-divider" />
+          <div class="smc-ctx-item muted" onClick=${(e) => doAction('radio', e)}>
+            <span class="smc-ctx-icon">~</span> Artist radio \u2014 ${artistName}
+          </div>
+        </div>
+      `}
+    </div>
+  `;
+}
+
+// ── Home View ───────────────────────────────────────────────────
+function HomeView({ hass, primaryEntity }) {
+  const [quickPicks, setQuickPicks] = useState([]);
+  const [randomArtists, setRandomArtists] = useState([]);
+  const [randomAlbums, setRandomAlbums] = useState([]);
+  const [listenAgain, setListenAgain] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [openMenuId, setOpenMenuId] = useState(null);
+  const hassRef = useRef(hass);
+  hassRef.current = hass;
+
+  // Close menu on outside click
+  useEffect(() => {
+    if (!openMenuId) return;
+    const close = () => setOpenMenuId(null);
+    document.addEventListener('click', close, { once: true });
+    return () => document.removeEventListener('click', close);
+  }, [openMenuId]);
+
+  const fetchSection = useCallback(async (mediaType, orderBy, limit) => {
+    const h = hassRef.current;
+    if (!h) return [];
+    const r = await h.callWS({
+      type: 'call_service',
+      domain: 'music_assistant',
+      service: 'get_library',
+      service_data: { config_entry_id: MA_ENTRY_ID, media_type: mediaType, order_by: orderBy, limit },
+      return_response: true,
+    });
+    return r?.response?.items || [];
+  }, []);
+
+  const loadAll = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [picks, artists, albums, again] = await Promise.all([
+        fetchSection('track', 'recently_played', 8),
+        fetchSection('artist', 'random', 10),
+        fetchSection('album', 'random', 10),
+        fetchSection('track', 'recently_played', 10),
+      ]);
+      setQuickPicks(picks);
+      setRandomArtists(artists);
+      setRandomAlbums(albums);
+      setListenAgain(again);
+    } catch (e) { console.error('[smc] HomeView load failed:', e); }
+    setLoading(false);
+  }, [fetchSection]);
+
+  useEffect(() => { loadAll(); }, []);
+
+  const playItem = useCallback(async (item, radioMode) => {
+    const h = hassRef.current;
+    if (!h || !primaryEntity) return;
+    try {
+      await h.callService('music_assistant', 'play_media', {
+        media_id: item.uri,
+        media_type: item.media_type,
+        radio_mode: radioMode,
+      }, { entity_id: primaryEntity });
+    } catch (err) { console.error('[smc] Home play failed:', err); }
+  }, [primaryEntity]);
+
+  const refreshSection = useCallback(async (section) => {
+    try {
+      if (section === 'picks') setQuickPicks(await fetchSection('track', 'recently_played', 8));
+      else if (section === 'artists') setRandomArtists(await fetchSection('artist', 'random', 10));
+      else if (section === 'albums') setRandomAlbums(await fetchSection('album', 'random', 10));
+      else if (section === 'again') setListenAgain(await fetchSection('track', 'recently_played', 10));
+    } catch (e) { console.error('[smc] Refresh failed:', e); }
+  }, [fetchSection]);
+
+  if (loading) return html`<p class="smc-loading">Loading...</p>`;
+
+  return html`
+    ${quickPicks.length > 0 && html`
+      <div class="smc-home-section">
+        <div class="smc-home-section-header">
+          <span class="smc-home-section-title">Quick Picks</span>
+          <button class="smc-home-refresh" onClick=${() => refreshSection('picks')}>\u21BB</button>
+        </div>
+        <div class="smc-browse-list">
+          ${quickPicks.map(item => html`
+            <${TrackRow} key=${item.uri} item=${item} hass=${hass}
+              entityId=${primaryEntity} onPlay=${() => playItem(item, false)}
+              openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />
+          `)}
+        </div>
+      </div>
+    `}
+    ${randomArtists.length > 0 && html`
+      <div class="smc-home-section">
+        <div class="smc-home-section-header">
+          <span class="smc-home-section-title">Random Artists</span>
+          <button class="smc-home-refresh" onClick=${() => refreshSection('artists')}>\u21BB</button>
+        </div>
+        <div class="smc-home-tiles">
+          ${randomArtists.map(item => html`
+            <div key=${item.uri} class="smc-home-tile" onClick=${() => playItem(item, true)}>
+              ${item.image
+                ? html`<img class="smc-home-tile-art" src=${smcResolveImage(item.image)} alt="" />`
+                : html`<div class="smc-home-tile-placeholder">\u{266A}</div>`
+              }
+              <p class="smc-home-tile-name">${item.name}</p>
+            </div>
+          `)}
+        </div>
+      </div>
+    `}
+    ${randomAlbums.length > 0 && html`
+      <div class="smc-home-section">
+        <div class="smc-home-section-header">
+          <span class="smc-home-section-title">Random Albums</span>
+          <button class="smc-home-refresh" onClick=${() => refreshSection('albums')}>\u21BB</button>
+        </div>
+        <div class="smc-home-tiles">
+          ${randomAlbums.map(item => html`
+            <div key=${item.uri} class="smc-home-tile" onClick=${() => playItem(item, false)}>
+              ${item.image
+                ? html`<img class="smc-home-tile-art" src=${smcResolveImage(item.image)} alt="" />`
+                : html`<div class="smc-home-tile-placeholder">\u{266A}</div>`
+              }
+              <p class="smc-home-tile-name">${item.name}</p>
+            </div>
+          `)}
+        </div>
+      </div>
+    `}
+    ${listenAgain.length > 0 && html`
+      <div class="smc-home-section">
+        <div class="smc-home-section-header">
+          <span class="smc-home-section-title">Listen Again</span>
+          <button class="smc-home-refresh" onClick=${() => refreshSection('again')}>\u21BB</button>
+        </div>
+        <div class="smc-browse-list">
+          ${listenAgain.map(item => html`
+            <${TrackRow} key=${item.uri} item=${item} hass=${hass}
+              entityId=${primaryEntity} onPlay=${() => playItem(item, false)}
+              openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />
+          `)}
+        </div>
+      </div>
+    `}
+  `;
+}
+
+// ── Search Result Row ────────────────────────────────────────────
+function SearchResultRow({ item, hass, entityId, onDrillFromSearch, openMenuId, setOpenMenuId }) {
+  const badge = getProviderBadge(item.uri);
+  const subtitle = item.media_type === 'track' || item.media_type === 'album'
+    ? (item.artists?.[0]?.name || '') : 'Artist';
+
+  const handleTap = useCallback(async () => {
+    if (item.media_type === 'artist') {
+      onDrillFromSearch(item, true);
+    } else if (item.media_type !== 'track') {
+      onDrillFromSearch(item, false);
+    }
+    // tracks handled by TrackRow
+  }, [item, onDrillFromSearch]);
+
+  // For tracks, render TrackRow with context menu
+  if (item.media_type === 'track') {
+    return html`<${TrackRow} item=${item} hass=${hass} entityId=${entityId}
+      openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />`;
+  }
+
+  return html`
+    <div class="smc-browse-row" onClick=${handleTap}>
+      ${item.image
+        ? html`<img class="smc-browse-thumb" src=${smcResolveImage(item.image)} alt="" />`
+        : html`<div class="smc-browse-thumb-placeholder">\u{266A}</div>`
+      }
+      <div class="smc-browse-info">
+        <p class="smc-browse-title">${item.name}</p>
+        <p class="smc-browse-subtitle">${subtitle}</p>
+      </div>
+      ${badge && html`
+        <span class="smc-provider-badge" style=${`color:${badge.color}; border:1px solid ${badge.color}; background:${badge.bg};`}>
+          ${badge.label}
+        </span>
+      `}
+      <span class="smc-browse-chevron">\u203A</span>
+    </div>
+  `;
+}
+
 // ── Browse View ─────────────────────────────────────────────────
 const MA_CATEGORIES = ['artists', 'albums', 'tracks', 'playlists', 'radio stations', 'podcasts', 'audiobooks'];
 function isMACategory(item) { return MA_CATEGORIES.includes((item.title || '').toLowerCase()); }
+function isHAMediaSource(item) { return (item.media_content_id || '').startsWith('media-source://'); }
 
 function BrowseView({ hass, selectedSpeakers, onPlay }) {
+  const [browseMode, setBrowseMode] = useState('home'); // 'home' | 'search' | 'library'
+  // -- Search state --
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState(null); // { artists, albums, tracks }
+  const [searchLoading, setSearchLoading] = useState(false);
+  const searchTimer = useRef(null);
+  // -- Library state --
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [breadcrumb, setBreadcrumb] = useState([]);
-  const [searchQuery, setSearchQuery] = useState('');
+  const [libFilter, setLibFilter] = useState('');
+  const [recentItems, setRecentItems] = useState([]);
+  const recentFetched = useRef(false);
+  const [currentContainer, setCurrentContainer] = useState(null);
+  const [openMenuId, setOpenMenuId] = useState(null);
   const entityId = selectedSpeakers[0];
   const hassRef = useRef(hass);
   hassRef.current = hass;
+
+  // Close menu on outside click
+  useEffect(() => {
+    if (!openMenuId) return;
+    const close = () => setOpenMenuId(null);
+    document.addEventListener('click', close, { once: true });
+    return () => document.removeEventListener('click', close);
+  }, [openMenuId]);
 
   const doBrowse = useCallback(async (eId, contentId, contentType) => {
     const h = hassRef.current;
@@ -536,18 +1131,24 @@ function BrowseView({ hass, selectedSpeakers, onPlay }) {
     return result;
   }, []);
 
+  // Filter root children: keep MA categories, remove HA media sources
+  const filterLibRoot = useCallback((children) => {
+    const maItems = children.filter(c => isMACategory(c) && !isHAMediaSource(c));
+    return maItems.length > 0 ? maItems : children.filter(c => !isHAMediaSource(c));
+  }, []);
+
+  // Load library root
   useEffect(() => {
     if (!entityId) return;
     let cancelled = false;
     const loadRoot = async () => {
       setLoading(true); setError(null); setItems([]);
+      setCurrentContainer(null);
       setBreadcrumb([{ title: 'Library', contentId: null, contentType: null }]);
       try {
         const result = await doBrowse(entityId, null, null);
         if (cancelled) return;
-        const children = result?.children || [];
-        const maItems = children.filter(isMACategory);
-        setItems(maItems.length > 0 ? maItems : children);
+        setItems(filterLibRoot(result?.children || []));
       } catch (err) { if (!cancelled) setError(err.message || String(err)); }
       finally { if (!cancelled) setLoading(false); }
     };
@@ -555,6 +1156,89 @@ function BrowseView({ hass, selectedSpeakers, onPlay }) {
     return () => { cancelled = true; };
   }, [entityId]);
 
+  // Fetch recently played (once per mount)
+  useEffect(() => {
+    if (!entityId || recentFetched.current) return;
+    recentFetched.current = true;
+    const fetchRecent = async () => {
+      try {
+        const h = hassRef.current;
+        if (!h) return;
+        const result = await h.callWS({
+          type: 'media_player/browse_media',
+          entity_id: entityId,
+          media_content_id: 'recently_played',
+          media_content_type: 'music_assistant',
+        });
+        setRecentItems((result?.children || []).slice(0, 6));
+      } catch { /* silently ignore */ }
+    };
+    fetchRecent();
+  }, [entityId]);
+
+  // Debounced MA search
+  useEffect(() => {
+    if (browseMode !== 'search') return;
+    clearTimeout(searchTimer.current);
+    if (!searchQuery || searchQuery.length < 2) {
+      setSearchResults(null);
+      setSearchLoading(false);
+      return;
+    }
+    setSearchLoading(true);
+    searchTimer.current = setTimeout(async () => {
+      const h = hassRef.current;
+      if (!h) return;
+      try {
+        const result = await h.callWS({
+          type: 'call_service',
+          domain: 'music_assistant',
+          service: 'search',
+          service_data: { config_entry_id: MA_ENTRY_ID, name: searchQuery, limit: 20 },
+          return_response: true,
+        });
+        const resp = result?.response || result;
+        setSearchResults({
+          artists: dedupeByName(resp.artists || []),
+          albums: dedupeByName(resp.albums || []),
+          tracks: dedupeByName(resp.tracks || []),
+        });
+      } catch (err) {
+        console.error('[smc] Search failed:', err);
+        setSearchResults({ artists: [], albums: [], tracks: [] });
+      }
+      setSearchLoading(false);
+    }, 400);
+    return () => clearTimeout(searchTimer.current);
+  }, [searchQuery, browseMode]);
+
+  // Drill from search result into browse tree (or play directly if browse fails)
+  const handleDrillFromSearch = useCallback(async (item, isArtist) => {
+    try {
+      const result = await doBrowse(entityId, item.uri, 'music_assistant');
+      if (result?.children?.length) {
+        // Switch to library mode to show drill-down
+        setBrowseMode('library');
+        setItems(result.children);
+        setCurrentContainer({ title: item.name, media_content_id: item.uri, media_content_type: 'music_assistant', media_class: item.media_type });
+        setBreadcrumb([
+          { title: 'Library', contentId: null, contentType: null },
+          { title: item.name, contentId: item.uri, contentType: 'music_assistant', _container: { title: item.name, media_content_id: item.uri, media_content_type: 'music_assistant', media_class: item.media_type } },
+        ]);
+        return;
+      }
+    } catch { /* browse failed — play directly */ }
+    // Fallback: play via MA service
+    try {
+      await hass.callService('music_assistant', 'play_media', {
+        media_id: item.uri,
+        media_type: item.media_type,
+        radio_mode: isArtist,
+      }, { entity_id: entityId });
+    } catch (err) { console.error('[smc] Search drill play failed:', err); }
+  }, [entityId, doBrowse, hass]);
+
+  // Library: handle item tap
   const handleItemTap = useCallback(async (item) => {
     if (item.can_expand) {
       setLoading(true); setError(null);
@@ -562,66 +1246,293 @@ function BrowseView({ hass, selectedSpeakers, onPlay }) {
         const drillType = item.media_class && item.media_class !== 'directory' ? item.media_class : item.media_content_type;
         const result = await doBrowse(entityId, item.media_content_id, drillType);
         setItems(result?.children || []);
-        setBreadcrumb(prev => [...prev, { title: item.title, contentId: item.media_content_id, contentType: item.media_content_type }]);
+        setCurrentContainer(item);
+        setBreadcrumb(prev => [...prev, { title: item.title, contentId: item.media_content_id, contentType: item.media_content_type, _container: item }]);
       } catch (err) { setError(err.message || String(err)); }
       finally { setLoading(false); }
-    } else if (item.can_play) { onPlay(item); }
-  }, [entityId, doBrowse, onPlay]);
+    } else if (item.can_play) {
+      if (currentContainer) {
+        onPlay({ ...item, _useContainer: currentContainer });
+      } else {
+        onPlay(item);
+      }
+    }
+  }, [entityId, doBrowse, onPlay, currentContainer]);
 
   const handleBreadcrumbTap = useCallback(async (index) => {
     if (index === breadcrumb.length - 1) return;
     const target = breadcrumb[index];
     setLoading(true); setError(null);
     setBreadcrumb(prev => prev.slice(0, index + 1));
+    setCurrentContainer(target._container || null);
     try {
-      const result = await doBrowse(entityId, target.contentId, target.contentType);
-      const children = result?.children || [];
-      setItems(index === 0 ? (children.filter(isMACategory).length > 0 ? children.filter(isMACategory) : children) : children);
+      if (index === 0) {
+        const result = await doBrowse(entityId, target.contentId, target.contentType);
+        setItems(filterLibRoot(result?.children || []));
+      } else {
+        const result = await doBrowse(entityId, target.contentId, target.contentType);
+        setItems(result?.children || []);
+      }
     } catch (err) { setError(err.message || String(err)); }
     finally { setLoading(false); }
-  }, [breadcrumb, entityId, doBrowse]);
+  }, [breadcrumb, entityId, doBrowse, filterLibRoot]);
+
+  // Detect artist list level for grouping
+  const isArtistLevel = breadcrumb.length === 2 &&
+    breadcrumb[breadcrumb.length - 1]?.title?.toLowerCase() === 'artists';
+
+  const handleFeatGroupTap = useCallback((group) => {
+    const subItems = [];
+    if (group.baseItem) subItems.push(group.baseItem);
+    subItems.push(...group.variants);
+    setItems(subItems);
+    setCurrentContainer(null);
+    setBreadcrumb(prev => [...prev, {
+      title: group.base,
+      contentId: null,
+      contentType: '__feat_group__',
+      _featItems: subItems,
+    }]);
+  }, []);
+
+  const handleBreadcrumbTapWrapped = useCallback(async (index) => {
+    if (index === breadcrumb.length - 1) return;
+    const target = breadcrumb[index];
+    if (target.contentType === '__feat_group__' && target._featItems) {
+      setBreadcrumb(prev => prev.slice(0, index + 1));
+      setItems(target._featItems);
+      setCurrentContainer(null);
+      return;
+    }
+    handleBreadcrumbTap(index);
+  }, [breadcrumb, handleBreadcrumbTap]);
+
+  // Context play handlers (artist/album shuffle/play)
+  const handleContextPlay = useCallback(async (shuffle) => {
+    if (!hass || !entityId || !currentContainer) return;
+    try {
+      const svcData = {
+        entity_id: entityId,
+        media_content_id: currentContainer.media_content_id,
+        media_content_type: currentContainer.media_content_type,
+      };
+      if (shuffle) svcData.extra = { shuffle: true };
+      await hass.callService('media_player', 'play_media', svcData);
+    } catch (err) { console.error('[smc] Context play failed:', err); }
+  }, [hass, entityId, currentContainer]);
+
+  // Play a recently played item directly
+  const handleRecentPlay = useCallback(async (item) => {
+    if (!hass || !entityId) return;
+    try {
+      await hass.callService('media_player', 'play_media', {
+        entity_id: entityId,
+        media_content_id: item.media_content_id,
+        media_content_type: item.media_content_type,
+      });
+    } catch (err) { console.error('[smc] Recent play failed:', err); }
+  }, [hass, entityId]);
 
   if (!entityId) {
     return html`<div class="smc-content"><p class="smc-header">Browse</p><p class="smc-error">Select a speaker first</p></div>`;
   }
 
+  // Library mode state
+  const isAtRoot = breadcrumb.length <= 1;
+  const showContextButtons = !isAtRoot && currentContainer &&
+    (currentContainer.media_class === 'artist' || currentContainer.media_class === 'album');
+  const isArtistContainer = currentContainer?.media_class === 'artist';
+
+  // Compute library display items
+  const displayItems = useMemo(() => {
+    const filtered = libFilter
+      ? items.filter(i => (i.title || '').toLowerCase().includes(libFilter.toLowerCase()))
+      : items;
+    if (isArtistLevel && !libFilter) {
+      return { grouped: true, rows: groupArtists(filtered) };
+    }
+    return { grouped: false, rows: filtered };
+  }, [items, libFilter, isArtistLevel]);
+
+  // Has any search results?
+  const hasResults = searchResults &&
+    (searchResults.artists.length || searchResults.albums.length || searchResults.tracks.length);
+
   return html`
     <div class="smc-content">
-      <div class="smc-search"><${IconSearch} /><input type="text"
-        placeholder="Filter..."
-        onInput=${(e) => { e.stopPropagation(); setSearchQuery(e.target.value); }}
-        onClick=${(e) => e.stopPropagation()}
-        onKeyDown=${(e) => e.stopPropagation()}
-      /></div>
-      ${breadcrumb.length > 1 && html`
-        <div class="smc-breadcrumb">
-          ${breadcrumb.map((crumb, i) => html`
-            ${i > 0 && html`<span class="smc-breadcrumb-sep">\u203A</span>`}
-            <span key=${i} class=${`smc-breadcrumb-item${i === breadcrumb.length - 1 ? ' current' : ''}`}
-              onClick=${() => handleBreadcrumbTap(i)}>${crumb.title}</span>
-          `)}
-        </div>
+      <!-- Mode toggle -->
+      <div class="smc-mode-toggle">
+        <div class=${`smc-mode-pill${browseMode === 'home' ? ' active' : ''}`}
+          onClick=${() => setBrowseMode('home')}>\u{1F3E0} Home</div>
+        <div class=${`smc-mode-pill${browseMode === 'search' ? ' active' : ''}`}
+          onClick=${() => setBrowseMode('search')}>\u{1F50D} Search</div>
+        <div class=${`smc-mode-pill${browseMode === 'library' ? ' active' : ''}`}
+          onClick=${() => setBrowseMode('library')}>\u266A My Library</div>
+      </div>
+
+      ${browseMode === 'home' && html`
+        <${HomeView} hass=${hass} primaryEntity=${entityId} />
       `}
-      ${breadcrumb.length <= 1 && html`<p class="smc-section-label">Library</p>`}
-      ${loading && html`<p class="smc-loading">Loading...</p>`}
-      ${error && html`<p class="smc-error">${error}</p>`}
-      ${!loading && !error && html`
-        <div class="smc-browse-list">
-          ${(searchQuery
-            ? items.filter(i => (i.title || '').toLowerCase().includes(searchQuery.toLowerCase()))
-            : items
-          ).map(item => html`
-            <div key=${item.media_content_id} class="smc-browse-row" onClick=${() => handleItemTap(item)}>
-              <div class="smc-browse-thumb-placeholder">${item.can_expand ? '\u{1F4C1}' : '\u{266A}'}</div>
-              <div class="smc-browse-info">
-                <p class="smc-browse-title">${item.title}</p>
-                <p class="smc-browse-subtitle">${getSubtitle(item)}</p>
+
+      ${browseMode === 'search' && html`
+        <!-- Search mode -->
+        <div class="smc-search"><${IconSearch} /><input type="text"
+          placeholder="Search Plex + YouTube Music..."
+          value=${searchQuery}
+          onInput=${(e) => { e.stopPropagation(); setSearchQuery(e.target.value); }}
+          onClick=${(e) => e.stopPropagation()}
+          onKeyDown=${(e) => e.stopPropagation()}
+        /></div>
+        ${!searchQuery && html`
+          <p class="smc-search-placeholder">Type to search across Plex and YouTube Music</p>
+        `}
+        ${searchQuery && searchQuery.length < 2 && html`
+          <p class="smc-search-placeholder">Keep typing...</p>
+        `}
+        ${searchLoading && html`<p class="smc-loading">Searching...</p>`}
+        ${!searchLoading && searchResults && !hasResults && html`
+          <p class="smc-search-placeholder">No results for "${searchQuery}"</p>
+        `}
+        ${!searchLoading && searchResults?.artists?.length > 0 && html`
+          <p class="smc-section-label">Artists</p>
+          <div class="smc-browse-list smc-search-section">
+            ${searchResults.artists.map(item => html`
+              <${SearchResultRow} key=${item.uri} item=${item} hass=${hass}
+                entityId=${entityId} onDrillFromSearch=${handleDrillFromSearch}
+                openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />
+            `)}
+          </div>
+        `}
+        ${!searchLoading && searchResults?.albums?.length > 0 && html`
+          <p class="smc-section-label">Albums</p>
+          <div class="smc-browse-list smc-search-section">
+            ${searchResults.albums.map(item => html`
+              <${SearchResultRow} key=${item.uri} item=${item} hass=${hass}
+                entityId=${entityId} onDrillFromSearch=${handleDrillFromSearch}
+                openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />
+            `)}
+          </div>
+        `}
+        ${!searchLoading && searchResults?.tracks?.length > 0 && html`
+          <p class="smc-section-label">Tracks</p>
+          <div class="smc-browse-list smc-search-section">
+            ${searchResults.tracks.map(item => html`
+              <${SearchResultRow} key=${item.uri} item=${item} hass=${hass}
+                entityId=${entityId} onDrillFromSearch=${handleDrillFromSearch}
+                openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />
+            `)}
+          </div>
+        `}
+      `}
+
+      ${browseMode === 'library' && html`
+        <!-- Library mode -->
+        <div class="smc-search"><${IconSearch} /><input type="text"
+          placeholder="Filter library..."
+          value=${libFilter}
+          onInput=${(e) => { e.stopPropagation(); setLibFilter(e.target.value); }}
+          onClick=${(e) => e.stopPropagation()}
+          onKeyDown=${(e) => e.stopPropagation()}
+        /></div>
+        ${isAtRoot && recentItems.length > 0 && html`
+          <p class="smc-section-label">Recently played</p>
+          <div class="smc-recent-row">
+            ${recentItems.map(item => html`
+              <div key=${item.media_content_id} class="smc-recent-tile" onClick=${() => handleRecentPlay(item)}>
+                ${item.thumbnail
+                  ? html`<img class="smc-recent-art" src=${item.thumbnail.startsWith('http') ? item.thumbnail : location.origin + item.thumbnail} alt="" />`
+                  : html`<div class="smc-recent-art-placeholder">\u{266A}</div>`
+                }
+                <p class="smc-recent-title">${item.title}</p>
               </div>
-              ${item.can_expand && html`<span class="smc-browse-chevron">\u203A</span>`}
-            </div>
-          `)}
-          ${items.length === 0 && html`<p class="smc-loading">No items found</p>`}
-        </div>
+            `)}
+          </div>
+        `}
+        ${breadcrumb.length > 1 && html`
+          <div class="smc-breadcrumb">
+            ${breadcrumb.map((crumb, i) => html`
+              ${i > 0 && html`<span class="smc-breadcrumb-sep">\u203A</span>`}
+              <span key=${i} class=${`smc-breadcrumb-item${i === breadcrumb.length - 1 ? ' current' : ''}`}
+                onClick=${() => handleBreadcrumbTapWrapped(i)}>${crumb.title}</span>
+            `)}
+          </div>
+        `}
+        ${showContextButtons && html`
+          <div class="smc-context-buttons">
+            <button class="smc-context-btn primary" onClick=${() => handleContextPlay(true)}>
+              \u21CC ${isArtistContainer ? `Shuffle all ${currentContainer.title}` : 'Shuffle album'}
+            </button>
+            <button class="smc-context-btn secondary" onClick=${() => handleContextPlay(false)}>
+              \u25B6 ${isArtistContainer ? `Play all ${currentContainer.title}` : 'Play album from start'}
+            </button>
+          </div>
+        `}
+        ${isAtRoot && !libFilter && html`<p class="smc-section-label">Library</p>`}
+        ${loading && html`<p class="smc-loading">Loading...</p>`}
+        ${error && html`<p class="smc-error">${error}</p>`}
+        ${!loading && !error && displayItems.grouped && html`
+          <div class="smc-browse-list">
+            ${displayItems.rows.map(entry => {
+              if (entry.type === 'single') {
+                const item = entry.item;
+                return html`
+                  <div key=${item.media_content_id} class="smc-browse-row" onClick=${() => handleItemTap(item)}>
+                    <div class="smc-browse-thumb-placeholder">${item.can_expand ? '\u{1F4C1}' : '\u{266A}'}</div>
+                    <div class="smc-browse-info">
+                      <p class="smc-browse-title">${item.title}</p>
+                      <p class="smc-browse-subtitle">Artist</p>
+                    </div>
+                    ${item.can_expand && html`<span class="smc-browse-chevron">\u203A</span>`}
+                  </div>
+                `;
+              }
+              return html`
+                <div key=${entry.base} class="smc-browse-row" onClick=${() =>
+                  entry.variants.length === 0 && entry.baseItem
+                    ? handleItemTap(entry.baseItem)
+                    : handleFeatGroupTap(entry)
+                }>
+                  <div class="smc-browse-thumb-placeholder">\u{1F4C1}</div>
+                  <div class="smc-browse-info">
+                    <p class="smc-browse-title">${entry.base}</p>
+                    <p class="smc-browse-subtitle">Artist</p>
+                  </div>
+                  ${entry.variants.length > 0 && html`
+                    <span style="font-size:9px; color:${THEME.muted}; margin-right:6px;">
+                      +${entry.variants.length} feat.
+                    </span>
+                  `}
+                  <span class="smc-browse-chevron">\u203A</span>
+                </div>
+              `;
+            })}
+            ${displayItems.rows.length === 0 && html`<p class="smc-loading">No items found</p>`}
+          </div>
+        `}
+        ${!loading && !error && !displayItems.grouped && html`
+          <div class="smc-browse-list">
+            ${displayItems.rows.map(item => {
+              // Tracks (can_play, not expandable) get context menu
+              if (item.can_play && !item.can_expand) {
+                return html`<${TrackRow} key=${item.media_content_id} item=${item}
+                  hass=${hass} entityId=${entityId}
+                  onPlay=${() => handleItemTap(item)}
+                  openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />`;
+              }
+              return html`
+                <div key=${item.media_content_id} class="smc-browse-row" onClick=${() => handleItemTap(item)}>
+                  <div class="smc-browse-thumb-placeholder">${item.can_expand ? '\u{1F4C1}' : '\u{266A}'}</div>
+                  <div class="smc-browse-info">
+                    <p class="smc-browse-title">${item.title}</p>
+                    <p class="smc-browse-subtitle">${getSubtitle(item)}</p>
+                  </div>
+                  ${item.can_expand && html`<span class="smc-browse-chevron">\u203A</span>`}
+                </div>
+              `;
+            })}
+            ${displayItems.rows.length === 0 && html`<p class="smc-loading">No items found</p>`}
+          </div>
+        `}
       `}
     </div>
   `;
@@ -788,6 +1699,11 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange }) {
       </div>
 
       <!-- Transport controls -->
+      ${np.isExternal ? html`
+        <p style="text-align:center; color:${THEME.muted}; font-size:12px; padding:12px 20px;">
+          Playing via ${np.source || 'external source'} \u2014 transport controls unavailable
+        </p>
+      ` : html`
       <div class="np-transport">
         <button class=${`np-transport-btn${np.shuffle ? ' active' : ''}`} onClick=${(e) => { e.stopPropagation(); handleShuffle(); }}>
           <${IconShuffle} />
@@ -803,6 +1719,7 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange }) {
           ${np.repeat === 'one' && html`<span class="np-repeat-badge">1</span>`}
         </button>
       </div>
+      `}
 
       <!-- Volume sliders -->
       <div class="np-volume-section">
@@ -861,9 +1778,12 @@ function MiniPlayer({ nowPlaying, hass, onTap }) {
         <p class="smc-mini-title">${nowPlaying.title}</p>
         ${nowPlaying.artist && html`<p class="smc-mini-artist">${nowPlaying.artist}</p>`}
       </div>
-      <button class="smc-mini-btn" onClick=${handlePlayPause}>
-        ${nowPlaying.isPlaying ? html`<${IconPause} />` : html`<${IconPlay} />`}
-      </button>
+      ${nowPlaying.isExternal
+        ? html`<span style="font-size:9px; color:${THEME.muted}; padding:4px 8px; border:1px solid ${THEME.border}; border-radius:4px;">${nowPlaying.source || 'EXT'}</span>`
+        : html`<button class="smc-mini-btn" onClick=${handlePlayPause}>
+            ${nowPlaying.isPlaying ? html`<${IconPause} />` : html`<${IconPlay} />`}
+          </button>`
+      }
     </div>
   `;
 }
@@ -892,9 +1812,10 @@ function BottomNav({ activeTab, onTabChange }) {
 const SMC_KEY = 'smc_selected_speakers';
 let _smcSpeakers = []; // THE selected speakers — single source of truth
 let _smcDirty = false; // set when smcAutoDetect changes _smcSpeakers
+let _smcUserSelected = false; // true after explicit user tap — blocks auto-detect
+let _smcUserSelectedAt = 0; // timestamp of last user tap
 
 function smcInit(hass) {
-
   // 1. Check for any currently playing/paused MA speaker
   const playing = Object.entries(hass.states)
     .find(([id, s]) => id.startsWith('media_player.') &&
@@ -906,24 +1827,52 @@ function smcInit(hass) {
   saved = saved.filter(id => hass.states[id]?.attributes?.mass_player_type === 'player');
 
   // 3. Priority: playing > saved > empty
-  _smcSpeakers = playing ? [playing] : saved.length > 0 ? saved : [];
-  console.log('[smc] init: speakers=', _smcSpeakers, 'playing=', playing, 'saved=', saved);
+  if (playing) {
+    _smcSpeakers = [playing];
+    _smcUserSelected = false; // auto-detect seeded
+  } else if (saved.length > 0) {
+    _smcSpeakers = saved;
+    _smcUserSelected = true; // user previously chose these
+  } else {
+    _smcSpeakers = [];
+    _smcUserSelected = false;
+  }
+  console.log('[smc] init: speakers=', _smcSpeakers, 'userSelected=', _smcUserSelected);
 }
 
-// Called on every hass update. If no selected speaker is currently playing,
-// auto-switches _smcSpeakers to whichever MA player IS playing (if any).
-// Does NOT persist to localStorage — only explicit user taps do that.
 function smcAutoDetect(hass) {
+  if (_smcUserSelected) {
+    // Hard block for 30s after any user tap
+    const age = Date.now() - _smcUserSelectedAt;
+    if (age < 30000) return;
+    // After 30s, only release if selection is completely idle
+    const selStillActive = _smcSpeakers.some(id => hasMediaContext(hass.states[id]));
+    if (selStillActive) return;
+    _smcUserSelected = false;
+  }
+
+  // Is any selected speaker actively playing?
   const selPlaying = _smcSpeakers.some(id =>
-    hasMediaContext(hass.states[id])
+    hass.states[id]?.state === 'playing'
   );
   if (selPlaying) return;
 
-  const active = Object.entries(hass.states).find(([id, s]) =>
+  // Find any MA player that is actively playing (not external source)
+  let active = Object.entries(hass.states).find(([id, s]) =>
     id.startsWith('media_player.') &&
     s.attributes?.mass_player_type === 'player' &&
-    hasMediaContext(s)
+    s.state === 'playing' &&
+    !isExternalSource(s)
   )?.[0];
+
+  // Fall back to paused (hasMediaContext) only if nothing is playing
+  if (!active) {
+    active = Object.entries(hass.states).find(([id, s]) =>
+      id.startsWith('media_player.') &&
+      s.attributes?.mass_player_type === 'player' &&
+      hasMediaContext(s)
+    )?.[0];
+  }
 
   if (active && !_smcSpeakers.includes(active)) {
     console.log('[smc] auto-detect: switching to', active);
@@ -933,12 +1882,22 @@ function smcAutoDetect(hass) {
   }
 }
 
-function smcSelectSpeaker(entityId) {
+function smcSelectSpeaker(entityId, hass) {
   const idx = _smcSpeakers.indexOf(entityId);
-  _smcSpeakers = idx >= 0
-    ? _smcSpeakers.filter(id => id !== entityId)
-    : [..._smcSpeakers, entityId];
-  // Save to localStorage — only on explicit user tap
+  if (idx >= 0) {
+    // Removing — unjoin if currently grouped
+    _smcSpeakers = _smcSpeakers.filter(id => id !== entityId);
+    const state = hass?.states[entityId];
+    const isGrouped = (state?.attributes?.group_members?.length || 0) > 1;
+    if (isGrouped && hass) {
+      hass.callService('media_player', 'unjoin', {}, { entity_id: entityId });
+    }
+  } else {
+    _smcSpeakers = [..._smcSpeakers, entityId];
+  }
+  _smcUserSelected = true;
+  _smcUserSelectedAt = Date.now();
+  _smcDirty = true;
   try { localStorage.setItem(SMC_KEY, JSON.stringify(_smcSpeakers)); } catch {}
 }
 
@@ -966,9 +1925,9 @@ function SonosMusicApp({ hass, config }) {
   [hass, selectedSpeakers]);
 
   const handleSelectSpeaker = useCallback((entityId) => {
-    smcSelectSpeaker(entityId);
-    forceUpdate(n => n + 1); // trigger re-render with new _smcSpeakers
-  }, []);
+    smcSelectSpeaker(entityId, hass);
+    forceUpdate(n => n + 1);
+  }, [hass]);
 
   const handleGroup = useCallback(async () => {
     if (!hass || selectedSpeakers.length < 2) return;
@@ -990,10 +1949,14 @@ function SonosMusicApp({ hass, config }) {
   const handlePlay = useCallback(async (item) => {
     if (!hass || !primaryEntity) return;
     try {
+      // If item has a parent container, play that instead (queues full album/artist)
+      const container = item._useContainer;
+      const contentId = container ? container.media_content_id : item.media_content_id;
+      const contentType = container ? container.media_content_type : item.media_content_type;
       await hass.callService('media_player', 'play_media', {
         entity_id: primaryEntity,
-        media_content_id: item.media_content_id,
-        media_content_type: item.media_content_type,
+        media_content_id: contentId,
+        media_content_type: contentType,
       });
     } catch (err) { console.error('[smc] Play failed:', err); }
   }, [hass, primaryEntity]);
@@ -1007,7 +1970,8 @@ function SonosMusicApp({ hass, config }) {
       <${BottomNav} activeTab=${activeTab} onTabChange=${setActiveTab} />
       <div class=${`smc-tab-panel${activeTab !== 'speakers' ? ' hidden' : ''}`}>
         <${SpeakersView} hass=${hass} selected=${selectedSpeakers}
-          onSelect=${handleSelectSpeaker} onGroup=${handleGroup} isPlaying=${isPlaying} />
+          onSelect=${handleSelectSpeaker} onGroup=${handleGroup} isPlaying=${isPlaying}
+          includePlayers=${config.include_players} excludePlayers=${config.exclude_players} />
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'browse' ? ' hidden' : ''}`}>
         <${BrowseView} hass=${hass} selectedSpeakers=${selectedSpeakers} onPlay=${handlePlay} />
@@ -1038,7 +2002,11 @@ class SonosMusicCard extends HTMLElement {
     if (this._root) this._renderApp();
   }
   get hass() { return this._hass; }
-  setConfig(config) { this._config = config || {}; }
+  setConfig(config) {
+    this._config = config || {};
+    this._includePlayers = config.include_players || null;
+    this._excludePlayers = config.exclude_players || [];
+  }
   _init() {
     this._root = this.attachShadow({ mode: 'open' });
     const style = document.createElement('style');

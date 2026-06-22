@@ -10,10 +10,13 @@ HA_URL="https://ha.dempsey5.com"
 RESOURCE_ID="209d071230f4490e838dba8d0eac535e"
 BASE_URL="/local/community/sonos-music-card/sonos-music-card.js"
 
-# Get HA token from environment or prompt
-if [ -z "$HA_TOKEN" ]; then
-  echo "Enter HA long-lived access token (or set HA_TOKEN env var):"
-  read -s HA_TOKEN
+# Get HA token from .env file, environment, or prompt
+if [ -z "$HOME_ASSISTANT_TOKEN" ] && [ -f "$(dirname "$0")/../.env" ]; then
+  source "$(dirname "$0")/../.env"
+fi
+if [ -z "$HOME_ASSISTANT_TOKEN" ]; then
+  echo "Set HOME_ASSISTANT_TOKEN in .env or environment"
+  exit 1
 fi
 
 VERSION=$(head -1 "$SRC" | grep -o 'v[0-9.]*' || echo "unknown")
@@ -27,7 +30,7 @@ cp "$SRC" "dist/sonos-music-card.js"
 
 # 3. Get current version param and increment
 CURRENT_V=$(curl -s "$HA_URL/api/lovelace/resources" \
-  -H "Authorization: Bearer $HA_TOKEN" | \
+  -H "Authorization: Bearer $HOME_ASSISTANT_TOKEN" | \
   python3 -c "
 import sys, json, re
 data = json.load(sys.stdin)
@@ -46,7 +49,7 @@ NEW_URL="${BASE_URL}?v=${NEXT_V}"
 # 4. Update resource URL
 echo "Bumping resource ?v=${CURRENT_V} -> ?v=${NEXT_V}..."
 curl -s -X PATCH "$HA_URL/api/lovelace/resources/$RESOURCE_ID" \
-  -H "Authorization: Bearer $HA_TOKEN" \
+  -H "Authorization: Bearer $HOME_ASSISTANT_TOKEN" \
   -H "Content-Type: application/json" \
   -d "{\"url\": \"$NEW_URL\", \"res_type\": \"module\"}" > /dev/null
 
