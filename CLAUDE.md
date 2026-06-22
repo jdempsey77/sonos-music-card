@@ -157,12 +157,9 @@ join / unjoin.
 4. **`entity_picture` is relative** — prepend `location.origin` if not `http`
 
 ## Speaker entity IDs (verified live in HA — 2026-06-22)
-The prior config used stale IDs (`family_room`, `office_2`, `float`, `basement_2`,
-`garage_2`) that don't exist on this HA. Real Sonos `media_player` entities:
-`media_player.living_room`, `media_player.office`, `media_player.garage`,
-`media_player.basement`, `media_player.bedroom`.
-(Entity friendly-names have drifted from the Sonos room names; the entity_id is
-authoritative. Confirm the room↔entity mapping in HA before trusting labels.)
+Real Sonos `media_player` entities (confirmed via CMDB and live HA registry):
+`media_player.family_room`, `media_player.office_2`, `media_player.garage_2`,
+`media_player.basement_2`, `media_player.float`.
 
 ## Card config (Lovelace)
 ```yaml
@@ -172,11 +169,11 @@ jellyfin_internal_url: http://<ska-lan-ip>:8096   # reachable by the speakers (s
 jellyfin_token: !secret jellyfin_token
 # jellyfin_user_id: <optional override>
 include_players:
-  - media_player.living_room
-  - media_player.office
-  - media_player.garage
-  - media_player.basement
-  - media_player.bedroom
+  - media_player.family_room
+  - media_player.office_2
+  - media_player.garage_2
+  - media_player.basement_2
+  - media_player.float
 ```
 `jellyfin_token` comes from HA `secrets.yaml`. `jellyfin_internal_url` defaults to
 `jellyfin_url` if omitted — but the public URL is not reachable by the speakers,
@@ -190,14 +187,15 @@ primary: '#3b82f6', accent: '#14b8a6', text: '#e5e5e5', muted: '#737373'
 No purple. Color is functional only (blue = selected, teal = group CTA, red = error).
 
 ## Current version
-**v0.13.0** — removed Music Assistant; Jellyfin browse + HA play_media.
+**v0.13.3** — square thumbnail Now Playing layout, Jellyfin art fallback, eager image loading.
 Check top of `src/sonos-music-card.js` for the exact version comment.
 
 ## Open work
-- [ ] Verify card renders clean in HA browser (no console errors) — needs user Cmd+R
-- [ ] Search tab (deferred — removed with MA)
+- [ ] Search tab (Jellyfin search API)
+- [ ] YouTube Music support (requires backend on ska — ytmusicapi or yt-dlp)
 - [ ] Artist/album "Play all" / "Shuffle" affordances in Browse
-- [ ] Now Playing queue view (no queue read source post-MA)
+- [ ] Now Playing queue view
+- [ ] Art that tracks queue advance (currently shows first track's art only)
 - [ ] Direct-play (avoid mp3 transcode) for lossless on capable renderers
 
 ## Session startup checklist
