@@ -5,8 +5,9 @@
 > `d5-automation` repo (`ecosystem.yaml`, `ECOSYSTEM_STATE.md`).
 
 ## Roles
-- **Orchestrator**: Claude.ai (this file lives here — read it every session)
-- **Implementer**: Claude Code on ska
+- **Owner**: Claude Code on ska — this file is the single authoritative doc for
+  this project. CC owns it and keeps it current (Claude.ai no longer maintains a
+  separate copy).
 - **Gate rule**: No deploy without the file loading clean in HA (no console errors, card renders)
 
 ## Project overview
@@ -28,7 +29,9 @@ src/sonos-music-card.js   <- source of truth, always edit this
 
 dist/sonos-music-card.js  <- copy of src, committed for HACS
 
-scripts/deploy.sh         <- rsync src to HA + (attempt) bump ?v= in HA Resources
+scripts/deploy.sh         <- rsync src to HA + copy to dist/ + bump ?v= in HA Resources
+
+scripts/bump-version.py   <- WebSocket ?v= cache-buster bump (called by deploy.sh)
 
 ## Why the architecture is HA-centric (network, no IPs here)
 Verified 2026-06-22 (details + addresses in private `d5-automation`):
@@ -57,26 +60,10 @@ directly via the internal Jellyfin URL.
 ## Deploy workflow
 ```
 cd ~/code/sonos-music-card
-export HOME=/home/jdempsey            # so deploy.sh finds the SSH key
-./scripts/deploy.sh                   # scp to HA + copy to dist/
+export HOME=/home/jdempsey      # so deploy.sh finds the SSH key
+./scripts/deploy.sh             # rsync to HA + copy to dist/ + bump ?v= automatically
 ```
 After deploy: **Cmd+R** in HA browser (NOT Cmd+Shift+R — clears session cookie).
-
-⚠️ **deploy.sh's `?v=` bump is broken on this HA.** It uses a REST endpoint
-(`/api/lovelace/resources`) that 404s here, so it silently reports a bogus
-`?v=0 -> v=1` and does NOT change the registry. Bump the cache-buster manually
-via the WebSocket API (the resource registry is WS-only, debounced ~1s to
-`/homeassistant/.storage/lovelace_resources`):
-```python
-# python3 with websocket-client (present on ska); $HOME_ASSISTANT_TOKEN from .env
-import json, websocket
-ws = websocket.create_connection("wss://ha.dempsey5.com/api/websocket", timeout=15)
-ws.recv(); ws.send(json.dumps({"type":"auth","access_token":TOKEN})); ws.recv()
-ws.send(json.dumps({"id":1,"type":"lovelace/resources/update",
-  "resource_id":"209d071230f4490e838dba8d0eac535e",
-  "url":"/local/community/sonos-music-card/sonos-music-card.js?v=NEXT","res_type":"module"}))
-print(json.loads(ws.recv()))   # {"success": true}
-```
 
 ## Git workflow
 cd ~/code/sonos-music-card
@@ -187,21 +174,29 @@ primary: '#3b82f6', accent: '#14b8a6', text: '#e5e5e5', muted: '#737373'
 No purple. Color is functional only (blue = selected, teal = group CTA, red = error).
 
 ## Current version
-**v0.13.3** — square thumbnail Now Playing layout, Jellyfin art fallback, eager image loading.
+**v0.14.0** — Search tab with Jellyfin full-text search, artist/album drill-down,
+breadcrumb nav. `playJfTracks()` extracted as shared module helper.
 Check top of `src/sonos-music-card.js` for the exact version comment.
 
 ## Open work
-- [ ] Search tab (Jellyfin search API)
-- [ ] YouTube Music support (requires backend on ska — ytmusicapi or yt-dlp)
+- [x] Search tab (Jellyfin search API) — v0.14.0
+- [ ] YouTube Music support (requires ytmusicapi Flask service on ska, nginx at ska.hq.stylee.org/ytm/)
 - [ ] Artist/album "Play all" / "Shuffle" affordances in Browse
 - [ ] Now Playing queue view
 - [ ] Art that tracks queue advance (currently shows first track's art only)
 - [ ] Direct-play (avoid mp3 transcode) for lossless on capable renderers
 
 ## Session startup checklist
-1. Read this file
+1. Read this file (`cat ~/code/sonos-music-card/CLAUDE.md`)
 2. `grep -m1 'v0\.' src/sonos-music-card.js` — confirm current version
 3. Check open work above
-4. Never edit the deployed file directly — always edit `src/`, then deploy
-5. After deploy, **manually bump `?v=`** via WS (deploy.sh's bump is broken — see above)
-6. Test in HA with Cmd+R
+4. Never edit the deployed file directly — always edit `src/`, then run `./scripts/deploy.sh`
+5. deploy.sh handles rsync + ?v= bump automatically. No manual WebSocket step needed.
+6. Test in HA with **Cmd+R** after deploy
+
+## CC session end checklist
+At the end of every CC session, before committing:
+1. Update `## Current version` in this file
+2. Update `## Open work` — check off completed items, add new ones
+3. Append a DECISION LOG entry to `~/code/d5-automation/ECOSYSTEM_STATE.md`
+4. `git add -A && git commit -m "..." && git push origin main` (both repos)
