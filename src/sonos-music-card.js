@@ -1,4 +1,4 @@
-// Sonos Music Card v0.13.0
+// Sonos Music Card v0.13.1
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -469,6 +469,13 @@ const cardStyles = `
 `;
 
 // ── Now-playing helpers ─────────────────────────────────────────
+// Resolve an image URL: HA entity_picture is often a relative proxy path
+// (e.g. /api/media_player_proxy/...) that needs location.origin prepended.
+function smcResolveImage(url) {
+  if (!url) return null;
+  return url.startsWith('http') ? url : `${location.origin}${url}`;
+}
+
 function buildNpInfo(id, state) {
   const a = state.attributes;
   const duration = (a.media_duration > 0 && a.media_duration < 86400)
@@ -480,9 +487,7 @@ function buildNpInfo(id, state) {
     title: a.media_title || 'Unknown',
     artist: a.media_artist || '',
     album: a.media_album_name || '',
-    art: a.entity_picture
-      ? (a.entity_picture.startsWith('http') ? a.entity_picture : `${location.origin}${a.entity_picture}`)
-      : null,
+    art: smcResolveImage(a.entity_picture),
     isPlaying: state.state === 'playing',
     isExternal: isExternalSource(state),
     source: a.source || null,
@@ -730,7 +735,7 @@ function BrowseView({ hass, selectedSpeakers }) {
             return html`
               <div key=${row.id} class="smc-browse-row" onClick=${onTap}>
                 ${img
-                  ? html`<img class="smc-browse-thumb" src=${img} alt="" loading="lazy" />`
+                  ? html`<img class="smc-browse-thumb" src=${img} alt="" loading="eager" />`
                   : html`<div class="smc-browse-thumb-placeholder">${row.icon || (row.track ? '♪' : '\u{1F4C1}')}</div>`
                 }
                 <div class="smc-browse-info">
@@ -849,7 +854,7 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange }) {
       <!-- Album art (compact) -->
       <div class="np-art-container">
         ${np.art
-          ? html`<img class="np-art" src=${np.art} alt="" />`
+          ? html`<img class="np-art" src=${np.art} alt="" loading="eager" />`
           : html`<div class="np-art-placeholder"><${IconMusicNote} /></div>`
         }
         <div class="np-art-gradient" />
@@ -928,7 +933,7 @@ function MiniPlayer({ nowPlaying, hass, onTap }) {
   return html`
     <div class="smc-mini-player" onClick=${onTap}>
       ${nowPlaying.art
-        ? html`<img class="smc-mini-art" src=${nowPlaying.art} alt="" />`
+        ? html`<img class="smc-mini-art" src=${nowPlaying.art} alt="" loading="eager" />`
         : html`<div class="smc-mini-art-placeholder" />`
       }
       <div class="smc-mini-info">
