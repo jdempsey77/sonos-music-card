@@ -1,4 +1,4 @@
-// Sonos Music Card v0.13.3
+// Sonos Music Card v0.14.0
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -149,6 +149,47 @@ async function jfFetchRows(frame) {
   }
 }
 
+// Full-text search across the music library. Returns items split by Type.
+async function jfSearch(term) {
+  const uid = await jfGetUserId();
+  const data = await jfGet(`/Items?searchTerm=${encodeURIComponent(term)}&IncludeItemTypes=Audio,MusicAlbum,MusicArtist&Recursive=true&Limit=50&UserId=${uid}`);
+  const items = data?.Items || [];
+  return {
+    artists: items.filter(i => i.Type === 'MusicArtist'),
+    albums: items.filter(i => i.Type === 'MusicAlbum'),
+    tracks: items.filter(i => i.Type === 'Audio'),
+  };
+}
+
+// Play a list of Jellyfin tracks from startIndex via HA. First track replaces
+// the queue; the rest are appended best-effort (Sonos supports enqueue=add).
+// Sets _smcNowPlayingJfId so Now Playing can source cover art from Jellyfin.
+async function playJfTracks(hass, eid, trackIds, startIndex) {
+  if (!hass || !eid || !trackIds?.length) return;
+  const ids = trackIds.slice(startIndex);
+  try {
+    await hass.callService('media_player', 'play_media', {
+      entity_id: eid,
+      media_content_id: jfStreamUrl(ids[0]),
+      media_content_type: 'music',
+    });
+    _smcNowPlayingJfId = ids[0];
+  } catch (err) {
+    console.error('[smc] play failed:', err);
+    return;
+  }
+  for (let i = 1; i < ids.length; i++) {
+    try {
+      await hass.callService('media_player', 'play_media', {
+        entity_id: eid,
+        media_content_id: jfStreamUrl(ids[i]),
+        media_content_type: 'music',
+        enqueue: 'add',
+      });
+    } catch { break; }
+  }
+}
+
 // ── Theme tokens ────────────────────────────────────────────────
 const THEME = {
   base: '#111111',
@@ -181,6 +222,7 @@ const THEME = {
 const IconSpeaker = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="6"/></svg>`;
 const IconBrowse = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>`;
 const IconNowPlaying = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
+const IconSearch = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`;
 const IconPlay = ({ size = 18 } = {}) => html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
 const IconPause = ({ size = 18 } = {}) => html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
 const IconPrev = () => html`<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="3" y="5" width="3" height="14"/><polygon points="21 5 9 12 21 19 21 5"/></svg>`;
@@ -476,6 +518,33 @@ const cardStyles = `
   .smc-tab-panel.hidden { display: none; }
 
   .smc-error { color: ${THEME.error}; font-size: 13px; text-align: center; padding: 20px; }
+
+  /* ── Search ── */
+  .smc-search-box {
+    padding: 12px 16px 8px;
+    flex-shrink: 0;
+  }
+  .smc-search-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: #1c1c1c;
+    border: 1px solid #2e2e2e;
+    border-radius: 8px;
+    color: #e5e5e5;
+    font-size: 13px;
+    padding: 8px 12px;
+    outline: none;
+    font-family: inherit;
+  }
+  .smc-search-input:focus { border-color: #3b82f6; }
+  .smc-search-empty {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #737373;
+    font-size: 13px;
+  }
 `;
 
 // ── Now-playing helpers ─────────────────────────────────────────
@@ -687,36 +756,8 @@ function BrowseView({ hass, selectedSpeakers }) {
   const push = useCallback((frame) => setStack(s => [...s, frame]), []);
   const gotoCrumb = useCallback((i) => setStack(s => s.slice(0, i + 1)), []);
 
-  // Play a list of Jellyfin tracks from startIndex via HA. First track replaces
-  // the queue; the rest are appended best-effort (Sonos supports enqueue=add).
-  const playList = useCallback(async (trackIds, startIndex) => {
-    const h = hassRef.current;
-    if (!h || !eid || !trackIds?.length) return;
-    const ids = trackIds.slice(startIndex);
-    try {
-      await h.callService('media_player', 'play_media', {
-        entity_id: eid,
-        media_content_id: jfStreamUrl(ids[0]),
-        media_content_type: 'music',
-      });
-      // Remember the track we started so Now Playing can source its cover art
-      // from Jellyfin (HA reports no entity_picture for Sonos URL playback).
-      _smcNowPlayingJfId = ids[0];
-    } catch (err) {
-      console.error('[smc] play failed:', err);
-      return;
-    }
-    for (let i = 1; i < ids.length; i++) {
-      try {
-        await h.callService('media_player', 'play_media', {
-          entity_id: eid,
-          media_content_id: jfStreamUrl(ids[i]),
-          media_content_type: 'music',
-          enqueue: 'add',
-        });
-      } catch { break; }
-    }
-  }, [eid]);
+  const playList = useCallback((trackIds, startIndex) =>
+    playJfTracks(hassRef.current, eid, trackIds, startIndex), [eid]);
 
   if (!eid) {
     return html`<div class="smc-content"><p class="smc-header">Browse</p><p class="smc-error">Select a speaker first</p></div>`;
@@ -762,6 +803,214 @@ function BrowseView({ hass, selectedSpeakers }) {
             `;
           })}
         </div>
+      `}
+    </div>
+  `;
+}
+
+// ── Search View (Jellyfin) ──────────────────────────────────────
+function SearchView({ hass, selectedSpeakers, onTabChange }) {
+  const [q, setQ] = useState('');
+  const [results, setResults] = useState(null);   // { artists, albums, tracks } | null
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState(null);
+  // SearchView owns its own drill stack. Empty = show search results (root).
+  const [drillStack, setDrillStack] = useState([]);
+  const [drillRows, setDrillRows] = useState([]);
+  const [drillLoading, setDrillLoading] = useState(false);
+  const [drillError, setDrillError] = useState(null);
+  const hassRef = useRef(hass);
+  hassRef.current = hass;
+  const eid = selectedSpeakers[0];
+  const debounceRef = useRef(null);
+
+  // Debounced search (400ms). Empty query clears results back to the prompt.
+  useEffect(() => {
+    if (!eid || !_jellyfinUrl || !_jellyfinToken) return;
+    const term = q.trim();
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (!term) { setResults(null); setSearchError(null); setSearching(false); return; }
+    let cancelled = false;
+    debounceRef.current = setTimeout(async () => {
+      setSearching(true); setSearchError(null);
+      try {
+        const data = await jfSearch(term);
+        if (!cancelled) setResults(data);
+      } catch (e) {
+        if (!cancelled) setSearchError(e?.message || String(e));
+      } finally {
+        if (!cancelled) setSearching(false);
+      }
+    }, 400);
+    return () => { cancelled = true; if (debounceRef.current) clearTimeout(debounceRef.current); };
+  }, [q, eid]);
+
+  // Drill-down fetch (artist → albums, album → tracks). jfFetchRows already
+  // handles these kinds. Empty stack = results, so nothing to fetch.
+  useEffect(() => {
+    if (!drillStack.length || !eid || !_jellyfinUrl || !_jellyfinToken) return;
+    let cancelled = false;
+    (async () => {
+      setDrillLoading(true); setDrillError(null);
+      try {
+        const r = await jfFetchRows(drillStack[drillStack.length - 1]);
+        if (!cancelled) setDrillRows(r || []);
+      } catch (e) {
+        if (!cancelled) setDrillError(e?.message || String(e));
+      } finally {
+        if (!cancelled) setDrillLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [drillStack, eid]);
+
+  const pushDrill = useCallback((frame) => setDrillStack(s => [...s, frame]), []);
+
+  // Tap a track: play it, then jump to Now Playing.
+  const playAndShow = useCallback((trackIds, startIndex) => {
+    playJfTracks(hassRef.current, eid, trackIds, startIndex);
+    if (onTabChange) onTabChange('playing');
+  }, [eid, onTabChange]);
+
+  const onInput = useCallback((e) => {
+    setQ(e.target.value);
+    // Editing the query implies a new search — drop back out of any drill.
+    setDrillStack(s => (s.length ? [] : s));
+  }, []);
+
+  if (!eid) {
+    return html`<div class="smc-content"><p class="smc-header">Search</p><p class="smc-error">Select a speaker first</p></div>`;
+  }
+  if (!_jellyfinUrl || !_jellyfinToken) {
+    return html`<div class="smc-content"><p class="smc-header">Search</p>
+      <p class="smc-error">Jellyfin not configured — set <code>jellyfin_url</code> and <code>jellyfin_token</code> in the card config.</p></div>`;
+  }
+
+  const inDrill = drillStack.length > 0;
+  const crumbs = ['Results', ...drillStack.map(f => f.title)];
+  const hasResults = results && (results.artists.length || results.albums.length || results.tracks.length);
+
+  const searchBox = html`
+    <div class="smc-search-box">
+      <input class="smc-search-input" type="search" value=${q}
+        placeholder="Search artists, albums, tracks…"
+        onInput=${onInput} />
+    </div>
+  `;
+
+  // Drill-down view — reuses the Browse row layout.
+  if (inDrill) {
+    return html`
+      ${searchBox}
+      <div class="smc-content">
+        <div class="smc-breadcrumb">
+          ${crumbs.map((title, i) => html`
+            ${i > 0 && html`<span class="smc-breadcrumb-sep">›</span>`}
+            <span key=${i} class=${`smc-breadcrumb-item${i === crumbs.length - 1 ? ' current' : ''}`}
+              onClick=${() => setDrillStack(s => s.slice(0, i))}>${title}</span>
+          `)}
+        </div>
+        ${drillLoading && html`<p class="smc-loading">Loading…</p>`}
+        ${drillError && html`<p class="smc-error">${drillError}</p>`}
+        ${!drillLoading && !drillError && html`
+          <div class="smc-browse-list">
+            ${drillRows.length === 0 && html`<p class="smc-loading">No items found</p>`}
+            ${drillRows.map(row => {
+              const img = row.imageTag ? jfImageUrl(row.id, row.imageTag) : null;
+              const onTap = row.track
+                ? () => playAndShow(row.trackIds, row.trackIndex)
+                : () => pushDrill(row.next);
+              return html`
+                <div key=${row.id} class="smc-browse-row" onClick=${onTap}>
+                  ${img
+                    ? html`<img class="smc-browse-thumb" src=${img} alt="" loading="eager" />`
+                    : html`<div class="smc-browse-thumb-placeholder">${row.icon || (row.track ? '♪' : '\u{1F4C1}')}</div>`
+                  }
+                  <div class="smc-browse-info">
+                    <p class="smc-browse-title">${row.name}</p>
+                    ${row.subtitle && html`<p class="smc-browse-subtitle">${row.subtitle}</p>`}
+                  </div>
+                  ${!row.track && html`<span class="smc-browse-chevron">›</span>`}
+                </div>
+              `;
+            })}
+          </div>
+        `}
+      </div>
+    `;
+  }
+
+  // Initial / empty state — centered prompt.
+  if (!searching && !searchError && !results) {
+    return html`
+      ${searchBox}
+      <div class="smc-search-empty">Search your Jellyfin library</div>
+    `;
+  }
+
+  // Results view — three sections, empty ones omitted.
+  return html`
+    ${searchBox}
+    <div class="smc-content">
+      ${searching && html`<p class="smc-loading">Searching…</p>`}
+      ${searchError && html`<p class="smc-error">${searchError}</p>`}
+      ${!searching && !searchError && results && !hasResults && html`
+        <div class="smc-search-empty">No results</div>
+      `}
+      ${!searching && !searchError && hasResults && html`
+        ${results.artists.length > 0 && html`
+          <p class="smc-section-label">Artists</p>
+          <div class="smc-browse-list">
+            ${results.artists.map(a => html`
+              <div key=${a.Id} class="smc-browse-row"
+                onClick=${() => pushDrill({ kind: 'artist', artistId: a.Id, title: a.Name })}>
+                ${a.ImageTags?.Primary
+                  ? html`<img class="smc-browse-thumb" src=${jfImageUrl(a.Id, a.ImageTags.Primary)} alt="" loading="eager" />`
+                  : html`<div class="smc-browse-thumb-placeholder">\u{1F3A4}</div>`}
+                <div class="smc-browse-info">
+                  <p class="smc-browse-title">${a.Name}</p>
+                  <p class="smc-browse-subtitle">Artist</p>
+                </div>
+                <span class="smc-browse-chevron">›</span>
+              </div>
+            `)}
+          </div>
+        `}
+        ${results.albums.length > 0 && html`
+          <p class="smc-section-label">Albums</p>
+          <div class="smc-browse-list">
+            ${results.albums.map(al => html`
+              <div key=${al.Id} class="smc-browse-row"
+                onClick=${() => pushDrill({ kind: 'album', albumId: al.Id, title: al.Name })}>
+                ${al.ImageTags?.Primary
+                  ? html`<img class="smc-browse-thumb" src=${jfImageUrl(al.Id, al.ImageTags.Primary)} alt="" loading="eager" />`
+                  : html`<div class="smc-browse-thumb-placeholder">\u{1F4BF}</div>`}
+                <div class="smc-browse-info">
+                  <p class="smc-browse-title">${al.Name}</p>
+                  <p class="smc-browse-subtitle">${al.AlbumArtist || 'Album'}</p>
+                </div>
+                <span class="smc-browse-chevron">›</span>
+              </div>
+            `)}
+          </div>
+        `}
+        ${results.tracks.length > 0 && html`
+          <p class="smc-section-label">Tracks</p>
+          <div class="smc-browse-list">
+            ${results.tracks.map(t => html`
+              <div key=${t.Id} class="smc-browse-row"
+                onClick=${() => playAndShow([t.Id], 0)}>
+                ${t.ImageTags?.Primary
+                  ? html`<img class="smc-browse-thumb" src=${jfImageUrl(t.Id, t.ImageTags.Primary)} alt="" loading="eager" />`
+                  : html`<div class="smc-browse-thumb-placeholder">♪</div>`}
+                <div class="smc-browse-info">
+                  <p class="smc-browse-title">${t.Name}</p>
+                  <p class="smc-browse-subtitle">${(t.Artists && t.Artists.join(', ')) || t.AlbumArtist || ''}</p>
+                </div>
+              </div>
+            `)}
+          </div>
+        `}
       `}
     </div>
   `;
@@ -965,6 +1214,7 @@ function MiniPlayer({ nowPlaying, hass, onTap }) {
 function BottomNav({ activeTab, onTabChange }) {
   const tabs = [
     { id: 'speakers', label: 'Speakers', icon: IconSpeaker },
+    { id: 'search', label: 'Search', icon: IconSearch },
     { id: 'browse', label: 'Browse', icon: IconBrowse },
     { id: 'playing', label: 'Now Playing', icon: IconNowPlaying },
   ];
@@ -1122,6 +1372,9 @@ function SonosMusicApp({ hass, config }) {
       <div class=${`smc-tab-panel${activeTab !== 'speakers' ? ' hidden' : ''}`}>
         <${SpeakersView} hass=${hass} selected=${selectedSpeakers}
           onSelect=${handleSelectSpeaker} onGroup=${handleGroup} isPlaying=${isPlaying} />
+      </div>
+      <div class=${`smc-tab-panel${activeTab !== 'search' ? ' hidden' : ''}`}>
+        <${SearchView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'browse' ? ' hidden' : ''}`}>
         <${BrowseView} hass=${hass} selectedSpeakers=${selectedSpeakers} />
