@@ -1,6 +1,6 @@
 {
   "name": "Sonos Music Card",
+  "description": "Full music browser and player for Sonos via Music Assistant",
   "render_readme": true,
-  "filename": "sonos-music-card.js",
-  "content_in_root": false
+  "homeassistant": "2024.1.0"
 }
