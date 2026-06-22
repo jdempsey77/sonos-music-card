@@ -1,5 +1,8 @@
-// Sonos Music Card v0.12.2
-// Preact + htm, no build step — Custom HA Lovelace card for Sonos via Music Assistant
+// Sonos Music Card v0.13.0
+// Preact + htm, no build step — Custom HA Lovelace card for Sonos.
+// Control/transport via native HA media_player services; media browsing via
+// Jellyfin API (direct HTTP from the card); playback via HA play_media of a
+// Jellyfin stream URL the speakers fetch directly. No Music Assistant.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -7,37 +10,132 @@ import htm from 'https://esm.sh/htm@3';
 
 const html = htm.bind(h);
 
-// ── Music Assistant config ─────────────────────────────────────
-const MA_ENTRY_ID = '01KMBK5ZVGF4V016KQG8ZGX9NK';
+// ── Card config (set in setConfig, read module-wide) ────────────
+let _smcConfig = {};
 
-function getProvider(uri = '') {
-  if (uri.startsWith('ytmusic--')) return 'ytm';
-  if (uri.startsWith('plex--'))    return 'plex';
-  if (uri.startsWith('library://')) return 'library';
-  return 'unknown';
+// ── Jellyfin config + client ────────────────────────────────────
+let _jellyfinUrl = null;          // public, browser-facing (browse + images)
+let _jellyfinInternalUrl = null;  // speaker-facing base for stream URLs
+let _jellyfinToken = null;
+let _jellyfinUserId = null;
+
+// GET against the Jellyfin API. Auth via api_key query param (not a custom
+// header) so the browser issues a simple CORS GET with no preflight.
+async function jfGet(path) {
+  if (!_jellyfinUrl || !_jellyfinToken) return null;
+  const sep = path.includes('?') ? '&' : '?';
+  try {
+    const r = await fetch(`${_jellyfinUrl}${path}${sep}api_key=${encodeURIComponent(_jellyfinToken)}`);
+    return r.ok ? r.json() : null;
+  } catch { return null; }
 }
 
-function getProviderBadge(uri = '') {
-  const p = getProvider(uri);
-  if (p === 'ytm')  return { label: 'YTM',  color: '#ef4444', bg: '#2d0a0a' };
-  if (p === 'plex') return { label: 'PLEX', color: '#4ade80', bg: '#0a2d0a' };
-  return null;
+async function jfGetUserId() {
+  if (_jellyfinUserId) return _jellyfinUserId;
+  // A jellyfin_user_id config override wins if set.
+  if (_smcConfig?.jellyfin_user_id) {
+    _jellyfinUserId = _smcConfig.jellyfin_user_id;
+    return _jellyfinUserId;
+  }
+  // API keys aren't tied to a user, so /Users/Me is invalid (400). Pick a user
+  // from /Users, preferring an administrator (sees all libraries).
+  const users = await jfGet('/Users');
+  if (Array.isArray(users) && users.length) {
+    const admin = users.find(u => u?.Policy?.IsAdministrator);
+    _jellyfinUserId = (admin || users[0]).Id || null;
+  }
+  return _jellyfinUserId;
 }
 
-function dedupeByName(items) {
-  const seen = new Set();
-  return items.filter(item => {
-    const key = item.name.toLowerCase();
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
+// Primary image (public endpoint — no token required).
+function jfImageUrl(itemId, tag) {
+  if (!_jellyfinUrl || !itemId) return null;
+  let u = `${_jellyfinUrl}/Items/${itemId}/Images/Primary?fillHeight=96&fillWidth=96&quality=90`;
+  if (tag) u += `&tag=${encodeURIComponent(tag)}`;
+  return u;
 }
 
-function smcResolveImage(url) {
-  if (!url) return null;
-  if (url.startsWith('http')) return url;
-  return `${location.origin}${url}`;
+// Speaker-facing stream URL — uses the internal Jellyfin base so the Sonos
+// speakers (on a different VLAN) can fetch it directly. mp3 transcode is the
+// most reliable container for Sonos over plain HTTP.
+function jfStreamUrl(itemId) {
+  return `${_jellyfinInternalUrl}/Audio/${itemId}/stream.mp3?api_key=${encodeURIComponent(_jellyfinToken)}&audioCodec=mp3`;
+}
+
+// Build normalized browse rows for a navigation frame.
+async function jfFetchRows(frame) {
+  const uid = await jfGetUserId();
+  switch (frame.kind) {
+    case 'root': {
+      const data = await jfGet(`/Users/${uid}/Views`);
+      const views = (data?.Items || []).filter(v => v.CollectionType === 'music');
+      return views.map(v => ({
+        id: v.Id, name: v.Name, subtitle: 'Library',
+        imageTag: v.ImageTags?.Primary,
+        next: { kind: 'library', title: v.Name, libId: v.Id },
+      }));
+    }
+    case 'library':
+      return [
+        { id: 'cat-artists', name: 'Artists', icon: '\u{1F3A4}', next: { kind: 'artists', title: 'Artists', libId: frame.libId } },
+        { id: 'cat-albums', name: 'Albums', icon: '\u{1F4BF}', next: { kind: 'albums', title: 'Albums', libId: frame.libId } },
+        { id: 'cat-playlists', name: 'Playlists', icon: '\u{1F3B5}', next: { kind: 'playlists', title: 'Playlists', libId: frame.libId } },
+      ];
+    case 'artists': {
+      const data = await jfGet(`/Artists?ParentId=${frame.libId}&Recursive=true&SortBy=SortName&SortOrder=Ascending&Limit=2000&UserId=${uid}`);
+      return (data?.Items || []).map(a => ({
+        id: a.Id, name: a.Name, subtitle: 'Artist',
+        imageTag: a.ImageTags?.Primary,
+        next: { kind: 'artist', title: a.Name, artistId: a.Id },
+      }));
+    }
+    case 'albums': {
+      const data = await jfGet(`/Items?ParentId=${frame.libId}&IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=SortName&SortOrder=Ascending&Limit=2000&UserId=${uid}`);
+      return (data?.Items || []).map(al => ({
+        id: al.Id, name: al.Name, subtitle: al.AlbumArtist || 'Album',
+        imageTag: al.ImageTags?.Primary,
+        next: { kind: 'album', title: al.Name, albumId: al.Id },
+      }));
+    }
+    case 'playlists': {
+      const data = await jfGet(`/Items?IncludeItemTypes=Playlist&Recursive=true&SortBy=SortName&Limit=500&UserId=${uid}`);
+      return (data?.Items || []).map(pl => ({
+        id: pl.Id, name: pl.Name, subtitle: 'Playlist',
+        imageTag: pl.ImageTags?.Primary,
+        next: { kind: 'playlist', title: pl.Name, playlistId: pl.Id },
+      }));
+    }
+    case 'artist': {
+      const data = await jfGet(`/Items?AlbumArtistIds=${frame.artistId}&IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=PremiereDate,ProductionYear,SortName&SortOrder=Descending&Limit=500&UserId=${uid}`);
+      return (data?.Items || []).map(al => ({
+        id: al.Id, name: al.Name, subtitle: al.ProductionYear ? String(al.ProductionYear) : 'Album',
+        imageTag: al.ImageTags?.Primary,
+        next: { kind: 'album', title: al.Name, albumId: al.Id },
+      }));
+    }
+    case 'album': {
+      const data = await jfGet(`/Items?ParentId=${frame.albumId}&IncludeItemTypes=Audio&SortBy=ParentIndexNumber,IndexNumber,SortName&Limit=500&UserId=${uid}`);
+      const items = data?.Items || [];
+      const trackIds = items.map(t => t.Id);
+      return items.map((t, i) => ({
+        id: t.Id, name: t.Name, track: true, trackIds, trackIndex: i,
+        subtitle: (t.Artists && t.Artists.join(', ')) || t.AlbumArtist || '',
+        imageTag: t.ImageTags?.Primary,
+      }));
+    }
+    case 'playlist': {
+      const data = await jfGet(`/Playlists/${frame.playlistId}/Items?UserId=${uid}&Limit=1000`);
+      const items = data?.Items || [];
+      const trackIds = items.map(t => t.Id);
+      return items.map((t, i) => ({
+        id: t.Id, name: t.Name, track: true, trackIds, trackIndex: i,
+        subtitle: (t.Artists && t.Artists.join(', ')) || '',
+        imageTag: t.ImageTags?.Primary,
+      }));
+    }
+    default:
+      return [];
+  }
 }
 
 // ── Theme tokens ────────────────────────────────────────────────
@@ -72,10 +170,8 @@ const THEME = {
 const IconSpeaker = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="6"/></svg>`;
 const IconBrowse = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>`;
 const IconNowPlaying = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
-const IconVolume = () => html`<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>`;
 const IconPlay = ({ size = 18 } = {}) => html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
 const IconPause = ({ size = 18 } = {}) => html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
-const IconSearch = () => html`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`;
 const IconPrev = () => html`<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="3" y="5" width="3" height="14"/><polygon points="21 5 9 12 21 19 21 5"/></svg>`;
 const IconNext = () => html`<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="18" y="5" width="3" height="14"/><polygon points="3 5 15 12 3 19 3 5"/></svg>`;
 const IconShuffle = () => html`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg>`;
@@ -206,17 +302,6 @@ const cardStyles = `
   .smc-nav-item svg { width: 14px; height: 14px; }
 
   /* ── Browse ── */
-  .smc-search {
-    display: flex; align-items: center; gap: 8px;
-    background: ${THEME.surface}; border: 1px solid ${THEME.border};
-    border-radius: ${THEME.radiusEl}; padding: 8px 12px; margin-bottom: 14px;
-  }
-  .smc-search svg { color: ${THEME.placeholder}; flex-shrink: 0; }
-  .smc-search input {
-    flex: 1; background: none; border: none; outline: none;
-    color: ${THEME.text}; font-size: 13px; font-family: ${THEME.font};
-  }
-  .smc-search input::placeholder { color: ${THEME.placeholder}; }
   .smc-breadcrumb {
     display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
     font-size: 10px; color: ${THEME.statusMuted}; margin-bottom: 12px; padding: 0 4px;
@@ -237,6 +322,10 @@ const cardStyles = `
     cursor: pointer; -webkit-tap-highlight-color: transparent;
   }
   .smc-browse-row:active { background: ${THEME.surface}; }
+  .smc-browse-thumb {
+    width: 38px; height: 38px; border-radius: 6px;
+    object-fit: cover; flex-shrink: 0; background: ${THEME.surface};
+  }
   .smc-browse-thumb-placeholder {
     width: 38px; height: 38px; border-radius: 6px;
     background: ${THEME.surface}; flex-shrink: 0;
@@ -359,17 +448,6 @@ const cardStyles = `
   }
   .np-volume-value { font-size: 10px; color: ${THEME.statusMuted}; width: 28px; text-align: right; }
 
-  /* Queue section */
-  .np-queue-toggle {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 10px 20px; cursor: pointer; border-top: 1px solid ${THEME.border};
-    -webkit-tap-highlight-color: transparent;
-  }
-  .np-queue-toggle span { font-size: 11px; color: ${THEME.muted}; text-transform: uppercase; letter-spacing: 0.1em; }
-  .np-queue-toggle svg { color: ${THEME.muted}; transition: transform 0.2s; }
-  .np-queue-toggle.open svg { transform: rotate(180deg); }
-  .np-queue-list { padding: 0 12px 16px; }
-
   /* Nothing playing */
   .np-empty {
     flex: 1; display: flex; flex-direction: column;
@@ -388,165 +466,9 @@ const cardStyles = `
   .smc-tab-panel.hidden { display: none; }
 
   .smc-error { color: ${THEME.error}; font-size: 13px; text-align: center; padding: 20px; }
-
-  /* ── Browse mode toggle ── */
-  .smc-mode-toggle {
-    display: flex; gap: 8px; margin-bottom: 14px;
-  }
-  .smc-mode-pill {
-    flex: 1; padding: 10px 12px; border-radius: ${THEME.radiusEl};
-    font-size: 12px; font-weight: 600; text-align: center;
-    cursor: pointer; -webkit-tap-highlight-color: transparent;
-    transition: background 0.15s, border-color 0.15s, color 0.15s;
-    border: 1px solid ${THEME.border}; background: ${THEME.surface}; color: ${THEME.muted};
-  }
-  .smc-mode-pill.active { background: ${THEME.primaryBg}; border-color: ${THEME.primary}; color: #93c5fd; }
-
-  /* ── Search results ── */
-  .smc-search-placeholder {
-    text-align: center; padding: 40px 20px; color: ${THEME.muted}; font-size: 13px;
-  }
-  .smc-search-section { margin-bottom: 8px; }
-  .smc-browse-thumb {
-    width: 38px; height: 38px; border-radius: 6px;
-    object-fit: cover; flex-shrink: 0;
-  }
-  .smc-provider-badge {
-    font-size: 8px; font-weight: 700; padding: 2px 5px;
-    border-radius: 4px; flex-shrink: 0; letter-spacing: 0.5px;
-  }
-
-  /* ── Recently played ── */
-  .smc-recent-row {
-    display: flex; gap: 10px; overflow-x: auto; padding: 0 0 12px;
-    scrollbar-width: none; -ms-overflow-style: none;
-  }
-  .smc-recent-row::-webkit-scrollbar { display: none; }
-  .smc-recent-tile {
-    flex-shrink: 0; width: 72px; cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
-  }
-  .smc-recent-art {
-    width: 72px; height: 72px; border-radius: 6px;
-    object-fit: cover; background: ${THEME.surface}; display: block;
-  }
-  .smc-recent-art-placeholder {
-    width: 72px; height: 72px; border-radius: 6px;
-    background: ${THEME.surface}; display: flex;
-    align-items: center; justify-content: center;
-    color: ${THEME.chevron}; font-size: 20px;
-  }
-  .smc-recent-title {
-    font-size: 10px; color: ${THEME.text}; margin: 4px 0 0;
-    overflow: hidden; text-overflow: ellipsis;
-    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-  }
-
-  /* ── Context play buttons ── */
-  .smc-context-buttons {
-    display: flex; gap: 8px; margin-bottom: 14px;
-  }
-  .smc-context-btn {
-    flex: 1; padding: 10px 12px; border-radius: ${THEME.radiusEl};
-    font-size: 12px; font-weight: 600; text-align: center;
-    cursor: pointer; border: none; -webkit-tap-highlight-color: transparent;
-  }
-  .smc-context-btn:active { opacity: 0.85; }
-  .smc-context-btn.primary { background: ${THEME.primary}; color: #fff; }
-  .smc-context-btn.secondary { background: ${THEME.surface}; color: ${THEME.text}; border: 1px solid ${THEME.border}; }
-
-  /* ── Home screen ── */
-  .smc-home-section { margin-bottom: 20px; }
-  .smc-home-section-header {
-    display: flex; align-items: center;
-    justify-content: space-between; margin-bottom: 8px;
-  }
-  .smc-home-section-title {
-    font-size: 10px; color: ${THEME.statusMuted};
-    text-transform: uppercase; letter-spacing: 0.1em;
-  }
-  .smc-home-refresh {
-    background: none; border: none; color: ${THEME.muted};
-    cursor: pointer; font-size: 14px; padding: 2px 4px;
-    -webkit-tap-highlight-color: transparent;
-  }
-  .smc-home-refresh:active { opacity: 0.6; }
-  .smc-home-tiles {
-    display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px;
-    scrollbar-width: none; -ms-overflow-style: none;
-  }
-  .smc-home-tiles::-webkit-scrollbar { display: none; }
-  .smc-home-tile {
-    flex-shrink: 0; width: 72px; cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
-  }
-  .smc-home-tile-art {
-    width: 72px; height: 72px; border-radius: 8px;
-    background: ${THEME.surface}; border: 1px solid ${THEME.border};
-    object-fit: cover; display: block; margin-bottom: 5px;
-  }
-  .smc-home-tile-placeholder {
-    width: 72px; height: 72px; border-radius: 8px;
-    background: ${THEME.surface}; border: 1px solid ${THEME.border};
-    display: flex; align-items: center; justify-content: center;
-    color: ${THEME.chevron}; font-size: 20px; margin-bottom: 5px;
-  }
-  .smc-home-tile-name {
-    font-size: 10px; color: ${THEME.muted};
-    text-align: center; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap;
-  }
-
-  /* ── Context menu ── */
-  .smc-more-btn {
-    width: 28px; height: 28px;
-    display: flex; align-items: center; justify-content: center;
-    border-radius: 6px; color: ${THEME.muted};
-    font-size: 13px; letter-spacing: 1px;
-    flex-shrink: 0; cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
-  }
-  .smc-more-btn:hover { background: ${THEME.surface}; color: ${THEME.text}; }
-  .smc-ctx-menu {
-    background: ${THEME.surface};
-    border: 1px solid ${THEME.border};
-    border-radius: 8px;
-    margin: 0 12px 4px 58px;
-    overflow: hidden;
-  }
-  .smc-ctx-item {
-    display: flex; align-items: center; gap: 10px;
-    padding: 9px 12px; font-size: 12px;
-    color: ${THEME.text}; cursor: pointer;
-    border-bottom: 1px solid #1a1a1a;
-  }
-  .smc-ctx-item:last-child { border-bottom: none; }
-  .smc-ctx-item:hover { background: #252525; }
-  .smc-ctx-item.primary { color: #93c5fd; }
-  .smc-ctx-item.green { color: #86efac; }
-  .smc-ctx-item.muted { color: ${THEME.muted}; }
-  .smc-ctx-icon {
-    width: 14px; text-align: center;
-    font-size: 11px; flex-shrink: 0; color: inherit;
-  }
-  .smc-ctx-divider { height: 1px; background: #1a1a1a; }
 `;
 
-// ── Helpers ─────────────────────────────────────────────────────
-function getSpeakerInfo(entityId, state) {
-  const attrs = state.attributes;
-  const name = attrs.friendly_name || entityId.replace('media_player.', '');
-  const volume = attrs.volume_level != null ? Math.round(attrs.volume_level * 100) : null;
-  const isGrouped = (attrs.group_members || []).length > 1;
-  let status = 'Idle';
-  if (state.state === 'playing') {
-    status = attrs.media_title ? `Playing \u00b7 ${attrs.media_title}` : 'Playing';
-  } else if (hasMediaContext(state)) {
-    status = attrs.media_title ? `Paused \u00b7 ${attrs.media_title}` : 'Paused';
-  } else if (isGrouped) { status = 'Grouped'; }
-  return { name, volume, status, isGrouped };
-}
-
+// ── Now-playing helpers ─────────────────────────────────────────
 function buildNpInfo(id, state) {
   const a = state.attributes;
   const duration = (a.media_duration > 0 && a.media_duration < 86400)
@@ -572,10 +494,15 @@ function buildNpInfo(id, state) {
   };
 }
 
+// True if a speaker is playing from a non-queue source (TV, line-in, AirPlay).
+// Playback we drive (HA play_media of a URL) reports no source, which we treat
+// as internal so transport controls remain available.
+const QUEUE_SOURCES = ['Queue', 'Music Assistant Queue', 'Sonos Queue'];
 function isExternalSource(state) {
-  if (!state) return false;
+  if (!state || state.state !== 'playing') return false;
   const source = state.attributes?.source;
-  return state.state === 'playing' && source && source !== 'Music Assistant Queue';
+  if (!source) return false;
+  return !QUEUE_SOURCES.some(q => source.includes(q));
 }
 
 function hasMediaContext(state) {
@@ -593,48 +520,41 @@ function hasMediaContext(state) {
   return false;
 }
 
+// ── Speaker detection ───────────────────────────────────────────
+// No Music Assistant dependency. Speakers come from include_players (explicit
+// list) or every media_player.* entity, minus any exclude_players.
+function getSpeakers(hass, config = _smcConfig) {
+  if (!hass) return [];
+  if (config?.include_players?.length) {
+    return config.include_players.filter(id => hass.states[id]);
+  }
+  let ids = Object.keys(hass.states).filter(id => id.startsWith('media_player.'));
+  if (config?.exclude_players?.length) {
+    ids = ids.filter(id => !config.exclude_players.includes(id));
+  }
+  return ids;
+}
+
 function getNowPlaying(hass, selectedSpeakers) {
   if (!hass) return null;
-  // Check selected speakers first
+  // Selected speakers first
   for (const id of selectedSpeakers) {
     const state = hass.states[id];
-    if (state && hasMediaContext(state)) {
-      return buildNpInfo(id, state);
-    }
+    if (state && hasMediaContext(state)) return buildNpInfo(id, state);
   }
-  // Fallback: find any MA player that is playing/paused
-  for (const [id, state] of Object.entries(hass.states)) {
-    if (id.startsWith('media_player.') &&
-        state.attributes.mass_player_type === 'player' &&
-        hasMediaContext(state)) {
-      return buildNpInfo(id, state);
-    }
+  // Fallback: any configured speaker with media context
+  for (const id of getSpeakers(hass)) {
+    const state = hass.states[id];
+    if (state && hasMediaContext(state)) return buildNpInfo(id, state);
   }
   return null;
 }
-
-function getSubtitle(item) {
-  const t = item.media_content_type || item.media_class || '';
-  if (t.includes('artist')) return 'Artist';
-  if (t.includes('album')) return 'Album';
-  if (t.includes('playlist')) return 'Playlist';
-  if (t.includes('track')) return 'Track';
-  if (t.includes('app')) return 'Source';
-  return t || '';
-}
-
 
 function formatTime(s) {
   if (!s || s < 0) return '0:00';
   const m = Math.floor(s / 60);
   const sec = Math.floor(s % 60);
   return `${m}:${sec < 10 ? '0' : ''}${sec}`;
-}
-
-// ── Speaker type detection ──────────────────────────────────────
-const SONOS_IDS = ['office_2', 'family_room', 'basement_2', 'garage_2', 'float'];
-function getSpeakerType(entityId) {
-  return SONOS_IDS.some(s => entityId.includes(s)) ? 'sonos' : 'google';
 }
 
 // ── Speaker Row ─────────────────────────────────────────────────
@@ -648,21 +568,18 @@ function SpeakerRow({ entityId, hass, selected, onToggle }) {
   const volPct = vol != null ? `${Math.round(vol * 100)}%` : '';
   const title = state?.attributes?.media_title;
 
-  let subtext = '';
+  let subtext = 'Idle';
   if (isOff) subtext = 'Off';
-  else if (isPlaying && title) subtext = `Playing \u00b7 ${title}`;
+  else if (isPlaying && title) subtext = `Playing · ${title}`;
   else if (isGrouped) subtext = 'Grouped';
-  else subtext = 'Idle';
 
   return html`
     <div class=${`smc-spk-row${selected ? ' selected' : ''}`}
          onClick=${() => onToggle(entityId)}>
       <div class=${`smc-chk${selected ? ' checked' : ''}`}>
-        ${selected ? '\u2713' : ''}
+        ${selected ? '✓' : ''}
       </div>
-      <div class="smc-spk-icon">
-        ${getSpeakerType(entityId) === 'google' ? 'G' : '\u266A'}
-      </div>
+      <div class="smc-spk-icon">♪</div>
       <div class="smc-spk-info">
         <p class=${`smc-spk-name${!selected && !isPlaying ? ' muted' : ''}`}>
           ${name}
@@ -677,76 +594,36 @@ function SpeakerRow({ entityId, hass, selected, onToggle }) {
 }
 
 // ── Speakers View ───────────────────────────────────────────────
-function SpeakersView({ hass, selected, onSelect, onGroup, isPlaying, includePlayers, excludePlayers }) {
-  const maPlayers = useMemo(() => {
-    if (!hass) return [];
-    if (includePlayers?.length) {
-      return includePlayers.filter(id => hass.states[id]).sort();
-    }
-    let players = Object.entries(hass.states)
-      .filter(([id, state]) => {
-        if (!id.startsWith('media_player.')) return false;
-        if (state.attributes?.mass_player_type !== 'player') return false;
-        const name = state.attributes?.friendly_name || '';
-        if (name.endsWith('+')) return false;
-        if (name.endsWith('(Cast)')) return false;
-        return true;
-      })
-      .map(([id]) => id);
-    if (excludePlayers?.length) {
-      players = players.filter(id => !excludePlayers.includes(id));
-    }
-    return players.sort();
-  }, [hass, includePlayers, excludePlayers]);
+function SpeakersView({ hass, selected, onSelect, onGroup, isPlaying }) {
+  const speakers = useMemo(() => getSpeakers(hass).slice().sort(), [hass]);
 
   const selectedNames = useMemo(() =>
     selected.map(id => hass?.states[id]?.attributes?.friendly_name || id.replace('media_player.', '')),
   [selected, hass]);
 
-  // Group by type
-  const { sonos, google } = useMemo(() => {
-    const s = [], g = [];
-    maPlayers.forEach(id => {
-      if (getSpeakerType(id) === 'sonos') s.push(id);
-      else g.push(id);
-    });
-    return { sonos: s, google: g };
-  }, [maPlayers]);
-
   const selectAll = useCallback(() => {
-    maPlayers.forEach(id => { if (!selected.includes(id)) onSelect(id); });
-  }, [maPlayers, selected, onSelect]);
+    speakers.forEach(id => { if (!selected.includes(id)) onSelect(id); });
+  }, [speakers, selected, onSelect]);
   const selectNone = useCallback(() => {
     selected.forEach(id => onSelect(id));
   }, [selected, onSelect]);
 
   return html`
     <div class="smc-content">
-      ${maPlayers.length === 0 && html`<p class="smc-error">No Music Assistant speakers found</p>`}
-      ${maPlayers.length > 0 && html`
+      ${speakers.length === 0 && html`<p class="smc-error">No speakers found</p>`}
+      ${speakers.length > 0 && html`
         <div class="smc-spk-header">
           <span class="smc-spk-title">Select speakers</span>
           <div class="smc-spk-quick">
             <span onClick=${selectAll}>All</span>
-            <span style="color:${THEME.border}">\u00b7</span>
+            <span style="color:${THEME.border}">·</span>
             <span onClick=${selectNone} style="color:${THEME.muted}">None</span>
           </div>
         </div>
-        ${sonos.length > 0 && html`
-          <div class="smc-spk-group-label">Sonos</div>
-          ${sonos.map(id => html`
-            <${SpeakerRow} key=${id} entityId=${id} hass=${hass}
-              selected=${selected.includes(id)} onToggle=${onSelect} />
-          `)}
-        `}
-        ${sonos.length > 0 && google.length > 0 && html`<div class="smc-spk-divider" />`}
-        ${google.length > 0 && html`
-          <div class="smc-spk-group-label">Google</div>
-          ${google.map(id => html`
-            <${SpeakerRow} key=${id} entityId=${id} hass=${hass}
-              selected=${selected.includes(id)} onToggle=${onSelect} />
-          `)}
-        `}
+        ${speakers.map(id => html`
+          <${SpeakerRow} key=${id} entityId=${id} hass=${hass}
+            selected=${selected.includes(id)} onToggle=${onSelect} />
+        `)}
       `}
     </div>
     ${selected.length >= 2 && html`
@@ -755,784 +632,116 @@ function SpeakersView({ hass, selected, onSelect, onGroup, isPlaying, includePla
           <span class="smc-group-names">${selectedNames.join(' + ')}</span>
           ${isPlaying && html`<div class="smc-group-warn">Changing group will briefly pause playback</div>`}
         </div>
-        <span class="smc-group-action">Play here \u25B6</span>
+        <span class="smc-group-action">Play here ▶</span>
       </div>
     `}
   `;
 }
 
-// ── Artist grouping (collapse feat. variants) ──────────────────
-function getBaseArtist(title) {
-  const match = title.match(/^(.+?)(?:\s+feat\.?\s|\s+featuring\s|\s+ft\.?\s)/i);
-  return match ? match[1].trim() : null;
-}
-
-function groupArtists(items) {
-  const baseNames = new Set(items.map(i => i.title));
-  const baseMap = new Map();
-  const standalones = [];
-
-  items.forEach(item => {
-    const base = getBaseArtist(item.title);
-    if (base) {
-      if (!baseMap.has(base)) baseMap.set(base, { baseItem: null, variants: [] });
-      baseMap.get(base).variants.push(item);
-    } else {
-      standalones.push(item);
-    }
-  });
-
-  // Link standalone entries to their variant groups
-  standalones.forEach(item => {
-    if (baseMap.has(item.title)) {
-      baseMap.get(item.title).baseItem = item;
-    }
-  });
-
-  const result = [];
-  const handledBases = new Set();
-
-  // Build sorted list: standalones that have groups become group entries
-  standalones.forEach(item => {
-    if (baseMap.has(item.title)) {
-      handledBases.add(item.title);
-      const g = baseMap.get(item.title);
-      result.push({ type: 'group', base: item.title, baseItem: g.baseItem, variants: g.variants });
-    } else {
-      result.push({ type: 'single', item });
-    }
-  });
-
-  // Groups with no standalone base entry
-  baseMap.forEach((g, base) => {
-    if (!handledBases.has(base)) {
-      result.push({ type: 'group', base, baseItem: null, variants: g.variants });
-    }
-  });
-
-  result.sort((a, b) => {
-    const nameA = a.type === 'single' ? a.item.title : a.base;
-    const nameB = b.type === 'single' ? b.item.title : b.base;
-    return nameA.localeCompare(nameB);
-  });
-  return result;
-}
-
-// ── Track Row with Context Menu ─────────────────────────────────
-function TrackRow({ item, hass, entityId, onPlay, openMenuId, setOpenMenuId }) {
-  const artistName = item.artists?.[0]?.name || item.artist || 'this artist';
-  const isMenuOpen = openMenuId === (item.uri || item.media_content_id);
-  const menuId = item.uri || item.media_content_id;
-
-  const handleMore = useCallback((e) => {
-    e.stopPropagation();
-    setOpenMenuId(prev => prev === menuId ? null : menuId);
-  }, [menuId, setOpenMenuId]);
-
-  const doAction = useCallback(async (action, e) => {
-    if (e) e.stopPropagation();
-    setOpenMenuId(null);
-    if (!hass || !entityId) return;
-    const mediaId = item.uri || item.media_content_id;
-    const mediaType = item.media_type || item.media_content_type || 'track';
-    try {
-      if (action === 'play') {
-        await hass.callService('music_assistant', 'play_media',
-          { media_id: mediaId, media_type: mediaType, radio_mode: false },
-          { entity_id: entityId });
-      } else if (action === 'next' || action === 'queue') {
-        // Check if speaker is playing — if idle, fall back to 'play' enqueue mode
-        const spkState = hass.states[entityId]?.state;
-        const isActive = spkState === 'playing' || spkState === 'paused';
-        const enqueueMode = isActive ? (action === 'next' ? 'next' : 'add') : 'play';
-        await hass.callService('music_assistant', 'play_media',
-          { media_id: mediaId, media_type: mediaType, enqueue: enqueueMode, radio_mode: false },
-          { entity_id: entityId });
-      } else if (action === 'radio') {
-        const artistUri = item.artists?.[0]?.uri || mediaId;
-        await hass.callService('music_assistant', 'play_media',
-          { media_id: artistUri, media_type: 'artist', radio_mode: true },
-          { entity_id: entityId });
-      }
-    } catch (err) { console.error('[smc] Context action failed:', err); }
-  }, [hass, entityId, item, setOpenMenuId]);
-
-  const title = item.name || item.title || 'Unknown';
-  const subtitle = item.artists?.[0]?.name || item.artist || 'track';
-  const image = item.image || (item.thumbnail ? (item.thumbnail.startsWith('http') ? item.thumbnail : location.origin + item.thumbnail) : null);
-  const badge = item.uri ? getProviderBadge(item.uri) : null;
-
-  return html`
-    <div>
-      <div class="smc-browse-row" onClick=${() => onPlay ? onPlay() : doAction('play')}>
-        ${image
-          ? html`<img class="smc-browse-thumb" src=${image} alt="" />`
-          : html`<div class="smc-browse-thumb-placeholder">\u{266A}</div>`
-        }
-        <div class="smc-browse-info">
-          <p class="smc-browse-title">${title}</p>
-          <p class="smc-browse-subtitle">${subtitle}</p>
-        </div>
-        ${badge && html`
-          <span class="smc-provider-badge" style=${`color:${badge.color}; border:1px solid ${badge.color}; background:${badge.bg};`}>
-            ${badge.label}
-          </span>
-        `}
-        <div class="smc-more-btn" onClick=${handleMore}>\u22EF</div>
-      </div>
-      ${isMenuOpen && html`
-        <div class="smc-ctx-menu" onClick=${(e) => e.stopPropagation()}>
-          <div class="smc-ctx-item primary" onClick=${(e) => doAction('play', e)}>
-            <span class="smc-ctx-icon">\u25B6</span> Play now
-          </div>
-          <div class="smc-ctx-item" onClick=${(e) => doAction('next', e)}>
-            <span class="smc-ctx-icon">\u00BB</span> Play next
-          </div>
-          <div class="smc-ctx-item" onClick=${(e) => doAction('queue', e)}>
-            <span class="smc-ctx-icon">+</span> Add to queue
-          </div>
-          <div class="smc-ctx-divider" />
-          <div class="smc-ctx-item muted" onClick=${(e) => doAction('radio', e)}>
-            <span class="smc-ctx-icon">~</span> Artist radio \u2014 ${artistName}
-          </div>
-        </div>
-      `}
-    </div>
-  `;
-}
-
-// ── Home View ───────────────────────────────────────────────────
-function HomeView({ hass, primaryEntity }) {
-  const [quickPicks, setQuickPicks] = useState([]);
-  const [randomArtists, setRandomArtists] = useState([]);
-  const [randomAlbums, setRandomAlbums] = useState([]);
-  const [listenAgain, setListenAgain] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [openMenuId, setOpenMenuId] = useState(null);
-  const hassRef = useRef(hass);
-  hassRef.current = hass;
-
-  // Close menu on outside click
-  useEffect(() => {
-    if (!openMenuId) return;
-    const close = () => setOpenMenuId(null);
-    document.addEventListener('click', close, { once: true });
-    return () => document.removeEventListener('click', close);
-  }, [openMenuId]);
-
-  const fetchSection = useCallback(async (mediaType, orderBy, limit) => {
-    const h = hassRef.current;
-    if (!h) return [];
-    const r = await h.callWS({
-      type: 'call_service',
-      domain: 'music_assistant',
-      service: 'get_library',
-      service_data: { config_entry_id: MA_ENTRY_ID, media_type: mediaType, order_by: orderBy, limit },
-      return_response: true,
-    });
-    return r?.response?.items || [];
-  }, []);
-
-  const loadAll = useCallback(async () => {
-    setLoading(true);
-    try {
-      const [picks, artists, albums, again] = await Promise.all([
-        fetchSection('track', 'recently_played', 8),
-        fetchSection('artist', 'random', 10),
-        fetchSection('album', 'random', 10),
-        fetchSection('track', 'recently_played', 10),
-      ]);
-      setQuickPicks(picks);
-      setRandomArtists(artists);
-      setRandomAlbums(albums);
-      setListenAgain(again);
-    } catch (e) { console.error('[smc] HomeView load failed:', e); }
-    setLoading(false);
-  }, [fetchSection]);
-
-  useEffect(() => { loadAll(); }, []);
-
-  const playItem = useCallback(async (item, radioMode) => {
-    const h = hassRef.current;
-    if (!h || !primaryEntity) return;
-    try {
-      await h.callService('music_assistant', 'play_media', {
-        media_id: item.uri,
-        media_type: item.media_type,
-        radio_mode: radioMode,
-      }, { entity_id: primaryEntity });
-    } catch (err) { console.error('[smc] Home play failed:', err); }
-  }, [primaryEntity]);
-
-  const refreshSection = useCallback(async (section) => {
-    try {
-      if (section === 'picks') setQuickPicks(await fetchSection('track', 'recently_played', 8));
-      else if (section === 'artists') setRandomArtists(await fetchSection('artist', 'random', 10));
-      else if (section === 'albums') setRandomAlbums(await fetchSection('album', 'random', 10));
-      else if (section === 'again') setListenAgain(await fetchSection('track', 'recently_played', 10));
-    } catch (e) { console.error('[smc] Refresh failed:', e); }
-  }, [fetchSection]);
-
-  if (loading) return html`<p class="smc-loading">Loading...</p>`;
-
-  return html`
-    ${quickPicks.length > 0 && html`
-      <div class="smc-home-section">
-        <div class="smc-home-section-header">
-          <span class="smc-home-section-title">Quick Picks</span>
-          <button class="smc-home-refresh" onClick=${() => refreshSection('picks')}>\u21BB</button>
-        </div>
-        <div class="smc-browse-list">
-          ${quickPicks.map(item => html`
-            <${TrackRow} key=${item.uri} item=${item} hass=${hass}
-              entityId=${primaryEntity} onPlay=${() => playItem(item, false)}
-              openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />
-          `)}
-        </div>
-      </div>
-    `}
-    ${randomArtists.length > 0 && html`
-      <div class="smc-home-section">
-        <div class="smc-home-section-header">
-          <span class="smc-home-section-title">Random Artists</span>
-          <button class="smc-home-refresh" onClick=${() => refreshSection('artists')}>\u21BB</button>
-        </div>
-        <div class="smc-home-tiles">
-          ${randomArtists.map(item => html`
-            <div key=${item.uri} class="smc-home-tile" onClick=${() => playItem(item, true)}>
-              ${item.image
-                ? html`<img class="smc-home-tile-art" src=${smcResolveImage(item.image)} alt="" />`
-                : html`<div class="smc-home-tile-placeholder">\u{266A}</div>`
-              }
-              <p class="smc-home-tile-name">${item.name}</p>
-            </div>
-          `)}
-        </div>
-      </div>
-    `}
-    ${randomAlbums.length > 0 && html`
-      <div class="smc-home-section">
-        <div class="smc-home-section-header">
-          <span class="smc-home-section-title">Random Albums</span>
-          <button class="smc-home-refresh" onClick=${() => refreshSection('albums')}>\u21BB</button>
-        </div>
-        <div class="smc-home-tiles">
-          ${randomAlbums.map(item => html`
-            <div key=${item.uri} class="smc-home-tile" onClick=${() => playItem(item, false)}>
-              ${item.image
-                ? html`<img class="smc-home-tile-art" src=${smcResolveImage(item.image)} alt="" />`
-                : html`<div class="smc-home-tile-placeholder">\u{266A}</div>`
-              }
-              <p class="smc-home-tile-name">${item.name}</p>
-            </div>
-          `)}
-        </div>
-      </div>
-    `}
-    ${listenAgain.length > 0 && html`
-      <div class="smc-home-section">
-        <div class="smc-home-section-header">
-          <span class="smc-home-section-title">Listen Again</span>
-          <button class="smc-home-refresh" onClick=${() => refreshSection('again')}>\u21BB</button>
-        </div>
-        <div class="smc-browse-list">
-          ${listenAgain.map(item => html`
-            <${TrackRow} key=${item.uri} item=${item} hass=${hass}
-              entityId=${primaryEntity} onPlay=${() => playItem(item, false)}
-              openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />
-          `)}
-        </div>
-      </div>
-    `}
-  `;
-}
-
-// ── Search Result Row ────────────────────────────────────────────
-function SearchResultRow({ item, hass, entityId, onDrillFromSearch, openMenuId, setOpenMenuId }) {
-  const badge = getProviderBadge(item.uri);
-  const subtitle = item.media_type === 'track' || item.media_type === 'album'
-    ? (item.artists?.[0]?.name || '') : 'Artist';
-
-  const handleTap = useCallback(async () => {
-    if (item.media_type === 'artist') {
-      onDrillFromSearch(item, true);
-    } else if (item.media_type !== 'track') {
-      onDrillFromSearch(item, false);
-    }
-    // tracks handled by TrackRow
-  }, [item, onDrillFromSearch]);
-
-  // For tracks, render TrackRow with context menu
-  if (item.media_type === 'track') {
-    return html`<${TrackRow} item=${item} hass=${hass} entityId=${entityId}
-      openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />`;
-  }
-
-  return html`
-    <div class="smc-browse-row" onClick=${handleTap}>
-      ${item.image
-        ? html`<img class="smc-browse-thumb" src=${smcResolveImage(item.image)} alt="" />`
-        : html`<div class="smc-browse-thumb-placeholder">\u{266A}</div>`
-      }
-      <div class="smc-browse-info">
-        <p class="smc-browse-title">${item.name}</p>
-        <p class="smc-browse-subtitle">${subtitle}</p>
-      </div>
-      ${badge && html`
-        <span class="smc-provider-badge" style=${`color:${badge.color}; border:1px solid ${badge.color}; background:${badge.bg};`}>
-          ${badge.label}
-        </span>
-      `}
-      <span class="smc-browse-chevron">\u203A</span>
-    </div>
-  `;
-}
-
-// ── Browse View ─────────────────────────────────────────────────
-const MA_CATEGORIES = ['artists', 'albums', 'tracks', 'playlists', 'radio stations', 'podcasts', 'audiobooks'];
-function isMACategory(item) { return MA_CATEGORIES.includes((item.title || '').toLowerCase()); }
-function isHAMediaSource(item) { return (item.media_content_id || '').startsWith('media-source://'); }
-
-function BrowseView({ hass, selectedSpeakers, onPlay }) {
-  const [browseMode, setBrowseMode] = useState('home'); // 'home' | 'search' | 'library'
-  // -- Search state --
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState(null); // { artists, albums, tracks }
-  const [searchLoading, setSearchLoading] = useState(false);
-  const searchTimer = useRef(null);
-  // -- Library state --
-  const [items, setItems] = useState([]);
+// ── Browse View (Jellyfin) ──────────────────────────────────────
+function BrowseView({ hass, selectedSpeakers }) {
+  const [stack, setStack] = useState([{ kind: 'root', title: 'Library' }]);
+  const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [breadcrumb, setBreadcrumb] = useState([]);
-  const [libFilter, setLibFilter] = useState('');
-  const [recentItems, setRecentItems] = useState([]);
-  const recentFetched = useRef(false);
-  const [currentContainer, setCurrentContainer] = useState(null);
-  const [openMenuId, setOpenMenuId] = useState(null);
-  const entityId = selectedSpeakers[0];
   const hassRef = useRef(hass);
   hassRef.current = hass;
+  const eid = selectedSpeakers[0];
 
-  // Close menu on outside click
+  const current = stack[stack.length - 1];
+
   useEffect(() => {
-    if (!openMenuId) return;
-    const close = () => setOpenMenuId(null);
-    document.addEventListener('click', close, { once: true });
-    return () => document.removeEventListener('click', close);
-  }, [openMenuId]);
-
-  const doBrowse = useCallback(async (eId, contentId, contentType) => {
-    const h = hassRef.current;
-    if (!h || !eId) return null;
-    const params = { type: 'media_player/browse_media', entity_id: eId };
-    if (contentId) { params.media_content_id = contentId; params.media_content_type = contentType || 'music_assistant'; }
-    const result = await h.callWS(params);
-    return result;
-  }, []);
-
-  // Filter root children: keep MA categories, remove HA media sources
-  const filterLibRoot = useCallback((children) => {
-    const maItems = children.filter(c => isMACategory(c) && !isHAMediaSource(c));
-    return maItems.length > 0 ? maItems : children.filter(c => !isHAMediaSource(c));
-  }, []);
-
-  // Load library root
-  useEffect(() => {
-    if (!entityId) return;
+    if (!eid || !_jellyfinUrl || !_jellyfinToken) return;
     let cancelled = false;
-    const loadRoot = async () => {
-      setLoading(true); setError(null); setItems([]);
-      setCurrentContainer(null);
-      setBreadcrumb([{ title: 'Library', contentId: null, contentType: null }]);
-      try {
-        const result = await doBrowse(entityId, null, null);
-        if (cancelled) return;
-        setItems(filterLibRoot(result?.children || []));
-      } catch (err) { if (!cancelled) setError(err.message || String(err)); }
-      finally { if (!cancelled) setLoading(false); }
-    };
-    loadRoot();
-    return () => { cancelled = true; };
-  }, [entityId]);
-
-  // Fetch recently played (once per mount)
-  useEffect(() => {
-    if (!entityId || recentFetched.current) return;
-    recentFetched.current = true;
-    const fetchRecent = async () => {
-      try {
-        const h = hassRef.current;
-        if (!h) return;
-        const result = await h.callWS({
-          type: 'media_player/browse_media',
-          entity_id: entityId,
-          media_content_id: 'recently_played',
-          media_content_type: 'music_assistant',
-        });
-        setRecentItems((result?.children || []).slice(0, 6));
-      } catch { /* silently ignore */ }
-    };
-    fetchRecent();
-  }, [entityId]);
-
-  // Debounced MA search
-  useEffect(() => {
-    if (browseMode !== 'search') return;
-    clearTimeout(searchTimer.current);
-    if (!searchQuery || searchQuery.length < 2) {
-      setSearchResults(null);
-      setSearchLoading(false);
-      return;
-    }
-    setSearchLoading(true);
-    searchTimer.current = setTimeout(async () => {
-      const h = hassRef.current;
-      if (!h) return;
-      try {
-        const result = await h.callWS({
-          type: 'call_service',
-          domain: 'music_assistant',
-          service: 'search',
-          service_data: { config_entry_id: MA_ENTRY_ID, name: searchQuery, limit: 20 },
-          return_response: true,
-        });
-        const resp = result?.response || result;
-        setSearchResults({
-          artists: dedupeByName(resp.artists || []),
-          albums: dedupeByName(resp.albums || []),
-          tracks: dedupeByName(resp.tracks || []),
-        });
-      } catch (err) {
-        console.error('[smc] Search failed:', err);
-        setSearchResults({ artists: [], albums: [], tracks: [] });
-      }
-      setSearchLoading(false);
-    }, 400);
-    return () => clearTimeout(searchTimer.current);
-  }, [searchQuery, browseMode]);
-
-  // Drill from search result into browse tree (or play directly if browse fails)
-  const handleDrillFromSearch = useCallback(async (item, isArtist) => {
-    try {
-      const result = await doBrowse(entityId, item.uri, 'music_assistant');
-      if (result?.children?.length) {
-        // Switch to library mode to show drill-down
-        setBrowseMode('library');
-        setItems(result.children);
-        setCurrentContainer({ title: item.name, media_content_id: item.uri, media_content_type: 'music_assistant', media_class: item.media_type });
-        setBreadcrumb([
-          { title: 'Library', contentId: null, contentType: null },
-          { title: item.name, contentId: item.uri, contentType: 'music_assistant', _container: { title: item.name, media_content_id: item.uri, media_content_type: 'music_assistant', media_class: item.media_type } },
-        ]);
-        return;
-      }
-    } catch { /* browse failed — play directly */ }
-    // Fallback: play via MA service
-    try {
-      await hass.callService('music_assistant', 'play_media', {
-        media_id: item.uri,
-        media_type: item.media_type,
-        radio_mode: isArtist,
-      }, { entity_id: entityId });
-    } catch (err) { console.error('[smc] Search drill play failed:', err); }
-  }, [entityId, doBrowse, hass]);
-
-  // Library: handle item tap
-  const handleItemTap = useCallback(async (item) => {
-    if (item.can_expand) {
+    (async () => {
       setLoading(true); setError(null);
       try {
-        const drillType = item.media_class && item.media_class !== 'directory' ? item.media_class : item.media_content_type;
-        const result = await doBrowse(entityId, item.media_content_id, drillType);
-        setItems(result?.children || []);
-        setCurrentContainer(item);
-        setBreadcrumb(prev => [...prev, { title: item.title, contentId: item.media_content_id, contentType: item.media_content_type, _container: item }]);
-      } catch (err) { setError(err.message || String(err)); }
-      finally { setLoading(false); }
-    } else if (item.can_play) {
-      if (currentContainer) {
-        onPlay({ ...item, _useContainer: currentContainer });
-      } else {
-        onPlay(item);
+        const r = await jfFetchRows(current);
+        if (!cancelled) setRows(r || []);
+      } catch (e) {
+        if (!cancelled) setError(e?.message || String(e));
+      } finally {
+        if (!cancelled) setLoading(false);
       }
-    }
-  }, [entityId, doBrowse, onPlay, currentContainer]);
+    })();
+    return () => { cancelled = true; };
+  }, [stack, eid]);
 
-  const handleBreadcrumbTap = useCallback(async (index) => {
-    if (index === breadcrumb.length - 1) return;
-    const target = breadcrumb[index];
-    setLoading(true); setError(null);
-    setBreadcrumb(prev => prev.slice(0, index + 1));
-    setCurrentContainer(target._container || null);
+  const push = useCallback((frame) => setStack(s => [...s, frame]), []);
+  const gotoCrumb = useCallback((i) => setStack(s => s.slice(0, i + 1)), []);
+
+  // Play a list of Jellyfin tracks from startIndex via HA. First track replaces
+  // the queue; the rest are appended best-effort (Sonos supports enqueue=add).
+  const playList = useCallback(async (trackIds, startIndex) => {
+    const h = hassRef.current;
+    if (!h || !eid || !trackIds?.length) return;
+    const ids = trackIds.slice(startIndex);
     try {
-      if (index === 0) {
-        const result = await doBrowse(entityId, target.contentId, target.contentType);
-        setItems(filterLibRoot(result?.children || []));
-      } else {
-        const result = await doBrowse(entityId, target.contentId, target.contentType);
-        setItems(result?.children || []);
-      }
-    } catch (err) { setError(err.message || String(err)); }
-    finally { setLoading(false); }
-  }, [breadcrumb, entityId, doBrowse, filterLibRoot]);
-
-  // Detect artist list level for grouping
-  const isArtistLevel = breadcrumb.length === 2 &&
-    breadcrumb[breadcrumb.length - 1]?.title?.toLowerCase() === 'artists';
-
-  const handleFeatGroupTap = useCallback((group) => {
-    const subItems = [];
-    if (group.baseItem) subItems.push(group.baseItem);
-    subItems.push(...group.variants);
-    setItems(subItems);
-    setCurrentContainer(null);
-    setBreadcrumb(prev => [...prev, {
-      title: group.base,
-      contentId: null,
-      contentType: '__feat_group__',
-      _featItems: subItems,
-    }]);
-  }, []);
-
-  const handleBreadcrumbTapWrapped = useCallback(async (index) => {
-    if (index === breadcrumb.length - 1) return;
-    const target = breadcrumb[index];
-    if (target.contentType === '__feat_group__' && target._featItems) {
-      setBreadcrumb(prev => prev.slice(0, index + 1));
-      setItems(target._featItems);
-      setCurrentContainer(null);
+      await h.callService('media_player', 'play_media', {
+        entity_id: eid,
+        media_content_id: jfStreamUrl(ids[0]),
+        media_content_type: 'music',
+      });
+    } catch (err) {
+      console.error('[smc] play failed:', err);
       return;
     }
-    handleBreadcrumbTap(index);
-  }, [breadcrumb, handleBreadcrumbTap]);
+    for (let i = 1; i < ids.length; i++) {
+      try {
+        await h.callService('media_player', 'play_media', {
+          entity_id: eid,
+          media_content_id: jfStreamUrl(ids[i]),
+          media_content_type: 'music',
+          enqueue: 'add',
+        });
+      } catch { break; }
+    }
+  }, [eid]);
 
-  // Context play handlers (artist/album shuffle/play)
-  const handleContextPlay = useCallback(async (shuffle) => {
-    if (!hass || !entityId || !currentContainer) return;
-    try {
-      const svcData = {
-        entity_id: entityId,
-        media_content_id: currentContainer.media_content_id,
-        media_content_type: currentContainer.media_content_type,
-      };
-      if (shuffle) svcData.extra = { shuffle: true };
-      await hass.callService('media_player', 'play_media', svcData);
-    } catch (err) { console.error('[smc] Context play failed:', err); }
-  }, [hass, entityId, currentContainer]);
-
-  // Play a recently played item directly
-  const handleRecentPlay = useCallback(async (item) => {
-    if (!hass || !entityId) return;
-    try {
-      await hass.callService('media_player', 'play_media', {
-        entity_id: entityId,
-        media_content_id: item.media_content_id,
-        media_content_type: item.media_content_type,
-      });
-    } catch (err) { console.error('[smc] Recent play failed:', err); }
-  }, [hass, entityId]);
-
-  if (!entityId) {
+  if (!eid) {
     return html`<div class="smc-content"><p class="smc-header">Browse</p><p class="smc-error">Select a speaker first</p></div>`;
   }
-
-  // Library mode state
-  const isAtRoot = breadcrumb.length <= 1;
-  const showContextButtons = !isAtRoot && currentContainer &&
-    (currentContainer.media_class === 'artist' || currentContainer.media_class === 'album');
-  const isArtistContainer = currentContainer?.media_class === 'artist';
-
-  // Compute library display items
-  const displayItems = useMemo(() => {
-    const filtered = libFilter
-      ? items.filter(i => (i.title || '').toLowerCase().includes(libFilter.toLowerCase()))
-      : items;
-    if (isArtistLevel && !libFilter) {
-      return { grouped: true, rows: groupArtists(filtered) };
-    }
-    return { grouped: false, rows: filtered };
-  }, [items, libFilter, isArtistLevel]);
-
-  // Has any search results?
-  const hasResults = searchResults &&
-    (searchResults.artists.length || searchResults.albums.length || searchResults.tracks.length);
+  if (!_jellyfinUrl || !_jellyfinToken) {
+    return html`<div class="smc-content"><p class="smc-header">Browse</p>
+      <p class="smc-error">Jellyfin not configured — set <code>jellyfin_url</code> and <code>jellyfin_token</code> in the card config.</p></div>`;
+  }
 
   return html`
     <div class="smc-content">
-      <!-- Mode toggle -->
-      <div class="smc-mode-toggle">
-        <div class=${`smc-mode-pill${browseMode === 'home' ? ' active' : ''}`}
-          onClick=${() => setBrowseMode('home')}>\u{1F3E0} Home</div>
-        <div class=${`smc-mode-pill${browseMode === 'search' ? ' active' : ''}`}
-          onClick=${() => setBrowseMode('search')}>\u{1F50D} Search</div>
-        <div class=${`smc-mode-pill${browseMode === 'library' ? ' active' : ''}`}
-          onClick=${() => setBrowseMode('library')}>\u266A My Library</div>
-      </div>
-
-      ${browseMode === 'home' && html`
-        <${HomeView} hass=${hass} primaryEntity=${entityId} />
+      ${stack.length > 1 && html`
+        <div class="smc-breadcrumb">
+          ${stack.map((f, i) => html`
+            ${i > 0 && html`<span class="smc-breadcrumb-sep">›</span>`}
+            <span key=${i} class=${`smc-breadcrumb-item${i === stack.length - 1 ? ' current' : ''}`}
+              onClick=${() => gotoCrumb(i)}>${f.title}</span>
+          `)}
+        </div>
       `}
-
-      ${browseMode === 'search' && html`
-        <!-- Search mode -->
-        <div class="smc-search"><${IconSearch} /><input type="text"
-          placeholder="Search Plex + YouTube Music..."
-          value=${searchQuery}
-          onInput=${(e) => { e.stopPropagation(); setSearchQuery(e.target.value); }}
-          onClick=${(e) => e.stopPropagation()}
-          onKeyDown=${(e) => e.stopPropagation()}
-        /></div>
-        ${!searchQuery && html`
-          <p class="smc-search-placeholder">Type to search across Plex and YouTube Music</p>
-        `}
-        ${searchQuery && searchQuery.length < 2 && html`
-          <p class="smc-search-placeholder">Keep typing...</p>
-        `}
-        ${searchLoading && html`<p class="smc-loading">Searching...</p>`}
-        ${!searchLoading && searchResults && !hasResults && html`
-          <p class="smc-search-placeholder">No results for "${searchQuery}"</p>
-        `}
-        ${!searchLoading && searchResults?.artists?.length > 0 && html`
-          <p class="smc-section-label">Artists</p>
-          <div class="smc-browse-list smc-search-section">
-            ${searchResults.artists.map(item => html`
-              <${SearchResultRow} key=${item.uri} item=${item} hass=${hass}
-                entityId=${entityId} onDrillFromSearch=${handleDrillFromSearch}
-                openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />
-            `)}
-          </div>
-        `}
-        ${!searchLoading && searchResults?.albums?.length > 0 && html`
-          <p class="smc-section-label">Albums</p>
-          <div class="smc-browse-list smc-search-section">
-            ${searchResults.albums.map(item => html`
-              <${SearchResultRow} key=${item.uri} item=${item} hass=${hass}
-                entityId=${entityId} onDrillFromSearch=${handleDrillFromSearch}
-                openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />
-            `)}
-          </div>
-        `}
-        ${!searchLoading && searchResults?.tracks?.length > 0 && html`
-          <p class="smc-section-label">Tracks</p>
-          <div class="smc-browse-list smc-search-section">
-            ${searchResults.tracks.map(item => html`
-              <${SearchResultRow} key=${item.uri} item=${item} hass=${hass}
-                entityId=${entityId} onDrillFromSearch=${handleDrillFromSearch}
-                openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />
-            `)}
-          </div>
-        `}
-      `}
-
-      ${browseMode === 'library' && html`
-        <!-- Library mode -->
-        <div class="smc-search"><${IconSearch} /><input type="text"
-          placeholder="Filter library..."
-          value=${libFilter}
-          onInput=${(e) => { e.stopPropagation(); setLibFilter(e.target.value); }}
-          onClick=${(e) => e.stopPropagation()}
-          onKeyDown=${(e) => e.stopPropagation()}
-        /></div>
-        ${isAtRoot && recentItems.length > 0 && html`
-          <p class="smc-section-label">Recently played</p>
-          <div class="smc-recent-row">
-            ${recentItems.map(item => html`
-              <div key=${item.media_content_id} class="smc-recent-tile" onClick=${() => handleRecentPlay(item)}>
-                ${item.thumbnail
-                  ? html`<img class="smc-recent-art" src=${item.thumbnail.startsWith('http') ? item.thumbnail : location.origin + item.thumbnail} alt="" />`
-                  : html`<div class="smc-recent-art-placeholder">\u{266A}</div>`
+      ${loading && html`<p class="smc-loading">Loading…</p>`}
+      ${error && html`<p class="smc-error">${error}</p>`}
+      ${!loading && !error && html`
+        <div class="smc-browse-list">
+          ${rows.length === 0 && html`<p class="smc-loading">No items found</p>`}
+          ${rows.map(row => {
+            const img = row.imageTag ? jfImageUrl(row.id, row.imageTag) : null;
+            const onTap = row.track
+              ? () => playList(row.trackIds, row.trackIndex)
+              : () => push(row.next);
+            return html`
+              <div key=${row.id} class="smc-browse-row" onClick=${onTap}>
+                ${img
+                  ? html`<img class="smc-browse-thumb" src=${img} alt="" loading="lazy" />`
+                  : html`<div class="smc-browse-thumb-placeholder">${row.icon || (row.track ? '♪' : '\u{1F4C1}')}</div>`
                 }
-                <p class="smc-recent-title">${item.title}</p>
+                <div class="smc-browse-info">
+                  <p class="smc-browse-title">${row.name}</p>
+                  ${row.subtitle && html`<p class="smc-browse-subtitle">${row.subtitle}</p>`}
+                </div>
+                ${!row.track && html`<span class="smc-browse-chevron">›</span>`}
               </div>
-            `)}
-          </div>
-        `}
-        ${breadcrumb.length > 1 && html`
-          <div class="smc-breadcrumb">
-            ${breadcrumb.map((crumb, i) => html`
-              ${i > 0 && html`<span class="smc-breadcrumb-sep">\u203A</span>`}
-              <span key=${i} class=${`smc-breadcrumb-item${i === breadcrumb.length - 1 ? ' current' : ''}`}
-                onClick=${() => handleBreadcrumbTapWrapped(i)}>${crumb.title}</span>
-            `)}
-          </div>
-        `}
-        ${showContextButtons && html`
-          <div class="smc-context-buttons">
-            <button class="smc-context-btn primary" onClick=${() => handleContextPlay(true)}>
-              \u21CC ${isArtistContainer ? `Shuffle all ${currentContainer.title}` : 'Shuffle album'}
-            </button>
-            <button class="smc-context-btn secondary" onClick=${() => handleContextPlay(false)}>
-              \u25B6 ${isArtistContainer ? `Play all ${currentContainer.title}` : 'Play album from start'}
-            </button>
-          </div>
-        `}
-        ${isAtRoot && !libFilter && html`<p class="smc-section-label">Library</p>`}
-        ${loading && html`<p class="smc-loading">Loading...</p>`}
-        ${error && html`<p class="smc-error">${error}</p>`}
-        ${!loading && !error && displayItems.grouped && html`
-          <div class="smc-browse-list">
-            ${displayItems.rows.map(entry => {
-              if (entry.type === 'single') {
-                const item = entry.item;
-                return html`
-                  <div key=${item.media_content_id} class="smc-browse-row" onClick=${() => handleItemTap(item)}>
-                    <div class="smc-browse-thumb-placeholder">${item.can_expand ? '\u{1F4C1}' : '\u{266A}'}</div>
-                    <div class="smc-browse-info">
-                      <p class="smc-browse-title">${item.title}</p>
-                      <p class="smc-browse-subtitle">Artist</p>
-                    </div>
-                    ${item.can_expand && html`<span class="smc-browse-chevron">\u203A</span>`}
-                  </div>
-                `;
-              }
-              return html`
-                <div key=${entry.base} class="smc-browse-row" onClick=${() =>
-                  entry.variants.length === 0 && entry.baseItem
-                    ? handleItemTap(entry.baseItem)
-                    : handleFeatGroupTap(entry)
-                }>
-                  <div class="smc-browse-thumb-placeholder">\u{1F4C1}</div>
-                  <div class="smc-browse-info">
-                    <p class="smc-browse-title">${entry.base}</p>
-                    <p class="smc-browse-subtitle">Artist</p>
-                  </div>
-                  ${entry.variants.length > 0 && html`
-                    <span style="font-size:9px; color:${THEME.muted}; margin-right:6px;">
-                      +${entry.variants.length} feat.
-                    </span>
-                  `}
-                  <span class="smc-browse-chevron">\u203A</span>
-                </div>
-              `;
-            })}
-            ${displayItems.rows.length === 0 && html`<p class="smc-loading">No items found</p>`}
-          </div>
-        `}
-        ${!loading && !error && !displayItems.grouped && html`
-          <div class="smc-browse-list">
-            ${displayItems.rows.map(item => {
-              // Tracks (can_play, not expandable) get context menu
-              if (item.can_play && !item.can_expand) {
-                return html`<${TrackRow} key=${item.media_content_id} item=${item}
-                  hass=${hass} entityId=${entityId}
-                  onPlay=${() => handleItemTap(item)}
-                  openMenuId=${openMenuId} setOpenMenuId=${setOpenMenuId} />`;
-              }
-              return html`
-                <div key=${item.media_content_id} class="smc-browse-row" onClick=${() => handleItemTap(item)}>
-                  <div class="smc-browse-thumb-placeholder">${item.can_expand ? '\u{1F4C1}' : '\u{266A}'}</div>
-                  <div class="smc-browse-info">
-                    <p class="smc-browse-title">${item.title}</p>
-                    <p class="smc-browse-subtitle">${getSubtitle(item)}</p>
-                  </div>
-                  ${item.can_expand && html`<span class="smc-browse-chevron">\u203A</span>`}
-                </div>
-              `;
-            })}
-            ${displayItems.rows.length === 0 && html`<p class="smc-loading">No items found</p>`}
-          </div>
-        `}
+            `;
+          })}
+        </div>
       `}
     </div>
   `;
@@ -1549,15 +758,6 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange }) {
   // selectedSpeakers[0], which may be null if _smcSpeakers wasn't yet synced.
   const entityId = np?.entityId || selectedSpeakers[0] || null;
   const [currentPos, setCurrentPos] = useState(0);
-  const [queueOpen, setQueueOpen] = useState(false);
-  const [queueItems, setQueueItems] = useState([]);
-  const [queueLoaded, setQueueLoaded] = useState(false);
-
-  // Reset queue when entity or track changes
-  useEffect(() => {
-    setQueueLoaded(false);
-    setQueueItems([]);
-  }, [entityId, np?.title]);
 
   // Real-time progress update
   useEffect(() => {
@@ -1613,29 +813,6 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange }) {
       volume_level: value / 100,
     });
   }, []);
-
-  // Load queue
-  useEffect(() => {
-    const queueEid = np?.entityId || selectedSpeakers[0];
-    if (!queueOpen || queueLoaded || !queueEid) return;
-    const h = hassRef.current;
-    if (!h) return;
-    const loadQueue = async () => {
-      try {
-        const result = await h.callWS({
-          type: 'media_player/browse_media',
-          entity_id: queueEid,
-          media_content_id: 'queue',
-          media_content_type: 'music_assistant',
-        });
-        setQueueItems(result?.children || []);
-      } catch (err) {
-        console.warn('[sonos-music-card] Queue load failed:', err);
-      }
-      setQueueLoaded(true);
-    };
-    loadQueue();
-  }, [queueOpen, queueLoaded, np, selectedSpeakers]);
 
   // Grouped speakers for volume — derive entityId inside memo
   const volumeSpeakers = useMemo(() => {
@@ -1701,7 +878,7 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange }) {
       <!-- Transport controls -->
       ${np.isExternal ? html`
         <p style="text-align:center; color:${THEME.muted}; font-size:12px; padding:12px 20px;">
-          Playing via ${np.source || 'external source'} \u2014 transport controls unavailable
+          Playing via ${np.source || 'external source'} — transport controls unavailable
         </p>
       ` : html`
       <div class="np-transport">
@@ -1723,7 +900,7 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange }) {
 
       <!-- Volume sliders -->
       <div class="np-volume-section">
-        <p class="np-volume-label">Volume \u00b7 ${volumeSpeakers.length} speaker${volumeSpeakers.length !== 1 ? 's' : ''}</p>
+        <p class="np-volume-label">Volume · ${volumeSpeakers.length} speaker${volumeSpeakers.length !== 1 ? 's' : ''}</p>
         ${volumeSpeakers.map(sp => html`
           <div class="np-volume-row" key=${sp.id}>
             <span class="np-volume-name">${sp.name}</span>
@@ -1735,26 +912,6 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange }) {
           </div>
         `)}
       </div>
-
-      <!-- Queue -->
-      <div class=${`np-queue-toggle${queueOpen ? ' open' : ''}`} onClick=${() => setQueueOpen(v => !v)}>
-        <span>Queue</span>
-        <${IconChevron} />
-      </div>
-      ${queueOpen && html`
-        <div class="np-queue-list">
-          ${queueItems.length === 0 && html`<p class="smc-loading">No queue items</p>`}
-          ${queueItems.map(item => html`
-            <div key=${item.media_content_id} class="smc-browse-row">
-              <div class="smc-browse-thumb-placeholder">\u{266A}</div>
-              <div class="smc-browse-info">
-                <p class="smc-browse-title">${item.title}</p>
-                <p class="smc-browse-subtitle">${getSubtitle(item)}</p>
-              </div>
-            </div>
-          `)}
-        </div>
-      `}
     </div>
   `;
 }
@@ -1816,23 +973,23 @@ let _smcUserSelected = false; // true after explicit user tap — blocks auto-de
 let _smcUserSelectedAt = 0; // timestamp of last user tap
 
 function smcInit(hass) {
-  // 1. Check for any currently playing/paused MA speaker
-  const playing = Object.entries(hass.states)
-    .find(([id, s]) => id.startsWith('media_player.') &&
-      s.attributes?.mass_player_type === 'player' && hasMediaContext(s))?.[0];
+  const speakers = getSpeakers(hass);
 
-  // 2. Try localStorage
+  // 1. Any currently playing/paused configured speaker
+  const playing = speakers.find(id => hasMediaContext(hass.states[id]));
+
+  // 2. localStorage (filtered to configured speakers)
   let saved = [];
   try { saved = JSON.parse(localStorage.getItem(SMC_KEY) || '[]'); } catch {}
-  saved = saved.filter(id => hass.states[id]?.attributes?.mass_player_type === 'player');
+  saved = saved.filter(id => speakers.includes(id));
 
   // 3. Priority: playing > saved > empty
   if (playing) {
     _smcSpeakers = [playing];
-    _smcUserSelected = false; // auto-detect seeded
+    _smcUserSelected = false;
   } else if (saved.length > 0) {
     _smcSpeakers = saved;
-    _smcUserSelected = true; // user previously chose these
+    _smcUserSelected = true;
   } else {
     _smcSpeakers = [];
     _smcUserSelected = false;
@@ -1841,6 +998,8 @@ function smcInit(hass) {
 }
 
 function smcAutoDetect(hass) {
+  const speakers = getSpeakers(hass);
+
   if (_smcUserSelected) {
     // Hard block for 30s after any user tap
     const age = Date.now() - _smcUserSelectedAt;
@@ -1852,26 +1011,18 @@ function smcAutoDetect(hass) {
   }
 
   // Is any selected speaker actively playing?
-  const selPlaying = _smcSpeakers.some(id =>
-    hass.states[id]?.state === 'playing'
-  );
+  const selPlaying = _smcSpeakers.some(id => hass.states[id]?.state === 'playing');
   if (selPlaying) return;
 
-  // Find any MA player that is actively playing (not external source)
-  let active = Object.entries(hass.states).find(([id, s]) =>
-    id.startsWith('media_player.') &&
-    s.attributes?.mass_player_type === 'player' &&
-    s.state === 'playing' &&
-    !isExternalSource(s)
-  )?.[0];
+  // Find any configured speaker actively playing (not external source)
+  let active = speakers.find(id => {
+    const s = hass.states[id];
+    return s?.state === 'playing' && !isExternalSource(s);
+  });
 
   // Fall back to paused (hasMediaContext) only if nothing is playing
   if (!active) {
-    active = Object.entries(hass.states).find(([id, s]) =>
-      id.startsWith('media_player.') &&
-      s.attributes?.mass_player_type === 'player' &&
-      hasMediaContext(s)
-    )?.[0];
+    active = speakers.find(id => hasMediaContext(hass.states[id]));
   }
 
   if (active && !_smcSpeakers.includes(active)) {
@@ -1915,7 +1066,6 @@ function SonosMusicApp({ hass, config }) {
 
   // Read directly from module-level state — always current
   const selectedSpeakers = _smcSpeakers;
-  const primaryEntity = selectedSpeakers[0] || null;
 
   // Derive now-playing directly from hass — no cached state
   const nowPlaying = useMemo(() => getNowPlaying(hass, selectedSpeakers), [hass, selectedSpeakers]);
@@ -1946,21 +1096,6 @@ function SonosMusicApp({ hass, config }) {
     } catch (err) { console.error('[smc] Group failed:', err); }
   }, [hass, selectedSpeakers]);
 
-  const handlePlay = useCallback(async (item) => {
-    if (!hass || !primaryEntity) return;
-    try {
-      // If item has a parent container, play that instead (queues full album/artist)
-      const container = item._useContainer;
-      const contentId = container ? container.media_content_id : item.media_content_id;
-      const contentType = container ? container.media_content_type : item.media_content_type;
-      await hass.callService('media_player', 'play_media', {
-        entity_id: primaryEntity,
-        media_content_id: contentId,
-        media_content_type: contentType,
-      });
-    } catch (err) { console.error('[smc] Play failed:', err); }
-  }, [hass, primaryEntity]);
-
   if (!hass) {
     return html`<div class="smc-card"><p class="smc-error">Waiting for HA connection...</p></div>`;
   }
@@ -1970,11 +1105,10 @@ function SonosMusicApp({ hass, config }) {
       <${BottomNav} activeTab=${activeTab} onTabChange=${setActiveTab} />
       <div class=${`smc-tab-panel${activeTab !== 'speakers' ? ' hidden' : ''}`}>
         <${SpeakersView} hass=${hass} selected=${selectedSpeakers}
-          onSelect=${handleSelectSpeaker} onGroup=${handleGroup} isPlaying=${isPlaying}
-          includePlayers=${config.include_players} excludePlayers=${config.exclude_players} />
+          onSelect=${handleSelectSpeaker} onGroup=${handleGroup} isPlaying=${isPlaying} />
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'browse' ? ' hidden' : ''}`}>
-        <${BrowseView} hass=${hass} selectedSpeakers=${selectedSpeakers} onPlay=${handlePlay} />
+        <${BrowseView} hass=${hass} selectedSpeakers=${selectedSpeakers} />
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'playing' ? ' hidden' : ''}`}>
         <${NowPlayingView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
@@ -2004,8 +1138,12 @@ class SonosMusicCard extends HTMLElement {
   get hass() { return this._hass; }
   setConfig(config) {
     this._config = config || {};
-    this._includePlayers = config.include_players || null;
-    this._excludePlayers = config.exclude_players || [];
+    _smcConfig = this._config;
+    const strip = (u) => (u ? String(u).replace(/\/+$/, '') : null);
+    _jellyfinUrl = strip(config.jellyfin_url);
+    _jellyfinInternalUrl = strip(config.jellyfin_internal_url) || _jellyfinUrl;
+    _jellyfinToken = config.jellyfin_token || null;
+    _jellyfinUserId = null;
   }
   _init() {
     this._root = this.attachShadow({ mode: 'open' });
@@ -2032,6 +1170,6 @@ if (!window.customCards.find(c => c.type === 'sonos-music-card')) {
   window.customCards.push({
     type: 'sonos-music-card',
     name: 'Sonos Music Card',
-    description: 'Full music browser and player for Sonos via Music Assistant',
+    description: 'Music browser and player for Sonos — Jellyfin library, native HA transport.',
   });
 }
