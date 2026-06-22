@@ -1,4 +1,4 @@
-// Sonos Music Card v0.13.2
+// Sonos Music Card v0.13.3
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -371,29 +371,28 @@ const cardStyles = `
   .smc-mini-btn:active { opacity: 0.7; }
 
   /* ── Now Playing ── */
-  .np-scroll { flex: 1; overflow-y: auto; padding-bottom: 60px; min-height: 0; }
-  .np-art-container {
-    position: relative; width: 100%; height: 240px;
-    background: ${THEME.surface}; overflow: hidden;
+  .np-scroll {
+    flex: 1; overflow-y: auto; min-height: 0;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 16px; padding-bottom: 60px;
   }
-  .np-art { width: 100%; height: 100%; object-fit: cover; display: block; }
-  .np-art-placeholder {
-    width: 100%; height: 100%;
+  .np-art-square {
+    width: 160px; height: 160px; border-radius: 12px;
+    object-fit: cover; background: ${THEME.surface};
+    display: block; flex-shrink: 0;
+  }
+  .np-art-square-placeholder {
+    width: 160px; height: 160px; border-radius: 12px;
+    background: ${THEME.surface}; flex-shrink: 0;
     display: flex; align-items: center; justify-content: center;
     color: ${THEME.chevron};
   }
-  .np-art-gradient {
-    position: absolute; bottom: 0; left: 0; right: 0; height: 50%;
-    background: linear-gradient(to bottom, transparent 0%, ${THEME.base} 100%);
-    pointer-events: none;
-  }
-  .np-track-info { padding: 0 20px; margin-top: -30px; position: relative; z-index: 1; }
-  .np-title { font-size: 18px; font-weight: 500; color: ${THEME.textBright}; margin: 0; }
-  .np-artist { font-size: 13px; color: ${THEME.statusSelected}; margin: 4px 0 0; }
-  .np-album { font-size: 11px; color: ${THEME.statusMuted}; margin: 2px 0 0; }
+  .np-track-info { width: 100%; text-align: center; margin-top: 16px; }
+  .np-title { font-size: 15px; font-weight: 500; color: ${THEME.textBright}; margin: 0; }
+  .np-artist { font-size: 12px; color: ${THEME.muted}; margin: 4px 0 0; }
 
   /* Progress bar */
-  .np-progress { padding: 16px 20px 0; }
+  .np-progress { width: 100%; padding: 20px 0 0; }
   .np-progress-bar {
     width: 100%; height: 3px; background: ${THEME.border}; border-radius: 2px;
     position: relative; cursor: pointer; -webkit-tap-highlight-color: transparent;
@@ -415,7 +414,7 @@ const cardStyles = `
   /* Transport controls */
   .np-transport {
     display: flex; align-items: center; justify-content: center;
-    gap: 24px; padding: 16px 20px;
+    gap: 24px; padding: 16px 0;
   }
   .np-transport-btn {
     background: none; border: none; color: ${THEME.muted}; cursor: pointer;
@@ -438,7 +437,7 @@ const cardStyles = `
   }
 
   /* Volume section */
-  .np-volume-section { padding: 8px 20px 16px; }
+  .np-volume-section { width: 100%; padding: 8px 0 16px; }
   .np-volume-label {
     font-size: 10px; color: ${THEME.statusMuted}; text-transform: uppercase;
     letter-spacing: 0.1em; margin-bottom: 10px;
@@ -867,20 +866,16 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange }) {
 
   return html`
     <div class="np-scroll">
-      <!-- Album art (compact) -->
-      <div class="np-art-container">
-        ${np.art
-          ? html`<img class="np-art" src=${np.art} alt="" loading="eager" />`
-          : html`<div class="np-art-placeholder"><${IconMusicNote} /></div>`
-        }
-        <div class="np-art-gradient" />
-      </div>
+      <!-- Album art (centered square) -->
+      ${np.art
+        ? html`<img class="np-art-square" src=${np.art} alt="" loading="eager" />`
+        : html`<div class="np-art-square-placeholder"><${IconMusicNote} /></div>`
+      }
 
       <!-- Track info -->
       <div class="np-track-info">
         <p class="np-title">${np.title}</p>
         ${np.artist && html`<p class="np-artist">${np.artist}</p>`}
-        ${np.album && html`<p class="np-album">${np.album}</p>`}
       </div>
 
       <!-- Progress bar -->
