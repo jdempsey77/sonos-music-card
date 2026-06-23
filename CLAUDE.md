@@ -155,6 +155,7 @@ jellyfin_url: https://jellyfin.hq.stylee.org
 jellyfin_internal_url: http://<ska-lan-ip>:8096   # reachable by the speakers (see d5-automation)
 jellyfin_token: !secret jellyfin_token
 # jellyfin_user_id: <optional override>
+# ytm_url: https://ska.hq.stylee.org/ytm   # optional override; this is the default
 include_players:
   - media_player.family_room
   - media_player.office_2
@@ -196,22 +197,51 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
-**v0.15.1** — Hotfix: artist collapse now handles both "Artist feat. X" and
-"Artist featuring X" (Jellyfin uses both spellings) via `getFeatIndex()`.
-v0.15.0 added the Queue tab (card-side queue, read-only + tap-to-jump), Play All /
-Add All at album & artist drill levels, and the initial "feat." collapse.
-`playJfTracks()` is metadata-aware (takes queue items, not bare ids).
+**v0.16.0** — YouTube Music tab. New `YTMView` (6th nav tab) backed by
+`ytm-service` on ska (ytmusicapi search + yt-dlp stream resolution, exposed at
+`ska.hq.stylee.org/ytm/`). Search songs/albums/artists, drill into albums,
+tap-to-play. Tapping a song resolves a direct googlevideo m4a URL (yt-dlp,
+~1-3s, per-row spinner) and hands it to the speaker via `play_media` — same
+pattern as Jellyfin. YTM playback clears the Jellyfin now-playing art id and
+card-side queue (different source). New module var `_ytmServiceUrl`; config key
+`ytm_url` (defaults to `https://ska.hq.stylee.org/ytm`). Bottom nav now wraps
+(`flex-wrap`) to fit 6 tabs on narrow cards. See `## YTM service` below.
+v0.15.1 — artist collapse handles both " feat." and " featuring " via
+`getFeatIndex()`. v0.15.0 added the Queue tab (card-side, read-only + tap-to-jump)
+and Play All / Add All. `playJfTracks()` is metadata-aware (queue items, not bare ids).
 Check top of `src/sonos-music-card.js` for the exact version comment.
+
+## YTM service
+YouTube Music backend (`ytm-service`) — runs on **ska**, NOT on GitHub (host-only,
+no public repo). Host-specific addresses live in private `d5-automation`.
+- **Location**: `~/code/ytm-service/app.py` on ska (Flask, ytmusicapi + yt-dlp).
+- **Auth**: none. ytmusicapi `search()`/`get_album()` and yt-dlp stream resolution
+  all work unauthenticated, so there is **no auth file and no cookies to expire**.
+  (Auth would only be needed for personal library/playlist editing, which we don't use.)
+- **Bind / proxy**: Flask on `127.0.0.1:8600`; nginx proxies `ska.hq.stylee.org/ytm/`
+  → `127.0.0.1:8600` (CORS `*`, no Authelia). nginx location is canonical in the
+  **portal** repo `nginx/ska.conf` (live copy: `/etc/nginx/sites-enabled/ska`).
+- **Endpoints**: `GET /ytm/search?q=&type=songs|albums|artists`,
+  `GET /ytm/album/<browseId>`, `GET /ytm/stream/<videoId>` (slow, ~1-3s — yt-dlp),
+  `GET /ytm/health`.
+- **Stream format**: yt-dlp `bestaudio[ext=m4a]/bestaudio/best` → m4a/AAC (itag 140),
+  which Sonos plays natively. URLs expire (~6h) so they're resolved on demand.
+- **systemd**: `systemctl --user status ytm-service` (user service, linger enabled).
+  Restart: `systemctl --user restart ytm-service`. Logs: `journalctl --user -u ytm-service`.
+- **Deps on ska**: `pip3 install yt-dlp ytmusicapi flask --break-system-packages`
+  (installed to `~/.local`, importable by `/usr/bin/python3` as user jdempsey).
 
 ## Open work
 - [x] Search tab (Jellyfin search API) — v0.14.0
 - [x] Now Playing queue view — v0.15.0 (Queue tab, card-side, read-only)
 - [x] Artist/album "Play all" affordance in Browse — v0.15.0 (Play All + Add All)
+- [x] YouTube Music support — v0.16.0 (ytm-service on ska; search + stream via yt-dlp)
 - [ ] "Shuffle" affordance for Play All / Add All
 - [ ] Queue reorder / delete (Queue tab is read-only this version)
-- [ ] YouTube Music support (requires ytmusicapi Flask service on ska, nginx at ska.hq.stylee.org/ytm/)
 - [ ] Art that tracks queue advance (currently shows first track's art only)
 - [ ] Direct-play (avoid mp3 transcode) for lossless on capable renderers
+- [ ] YTM Now Playing art (raw stream URL has no cover; HA gives no entity_picture)
+- [ ] YTM card-side queue (YTM playback clears `_smcQueue`; Queue tab empty for YTM)
 
 ## Session startup checklist
 1. Read this file (`cat ~/code/sonos-music-card/CLAUDE.md`)

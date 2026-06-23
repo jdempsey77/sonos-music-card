@@ -1,8 +1,10 @@
-// Sonos Music Card v0.15.1
+// Sonos Music Card v0.16.0
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
 // Jellyfin stream URL the speakers fetch directly. No Music Assistant.
+// v0.16.0 adds a YouTube Music tab backed by ytm-service on ska (ytmusicapi
+// search + yt-dlp stream resolution); speakers fetch the googlevideo m4a URL.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -18,6 +20,11 @@ let _jellyfinUrl = null;          // public, browser-facing (browse + images)
 let _jellyfinInternalUrl = null;  // speaker-facing base for stream URLs
 let _jellyfinToken = null;
 let _jellyfinUserId = null;
+
+// ── YouTube Music config ────────────────────────────────────────
+// ytm-service on ska: ytmusicapi search + yt-dlp stream resolution, exposed at
+// ska.hq.stylee.org/ytm/. Speakers fetch the resolved googlevideo m4a URL.
+let _ytmServiceUrl = null;        // browser-facing base, e.g. https://ska.hq.stylee.org/ytm
 // Jellyfin item id of the track we last started from Browse. Sonos doesn't
 // reflect Jellyfin cover art back through HA (entity_picture is null), so we
 // use this to source the Now Playing art ourselves. Cleared when idle.
@@ -267,6 +274,60 @@ async function jfArtistTracks(artistId) {
   return out;
 }
 
+// ── YouTube Music client (ytm-service) ──────────────────────────
+// All endpoints are simple CORS GETs (the service returns Access-Control-Allow-
+// Origin: *). Failures degrade to empty results / null rather than throwing.
+async function ytmSearch(q, type = 'songs') {
+  if (!_ytmServiceUrl) return { results: [] };
+  try {
+    const r = await fetch(`${_ytmServiceUrl}/search?q=${encodeURIComponent(q)}&type=${type}`);
+    return r.ok ? r.json() : { results: [] };
+  } catch { return { results: [] }; }
+}
+
+async function ytmAlbumTracks(browseId) {
+  if (!_ytmServiceUrl) return { tracks: [] };
+  try {
+    const r = await fetch(`${_ytmServiceUrl}/album/${encodeURIComponent(browseId)}`);
+    return r.ok ? r.json() : { tracks: [] };
+  } catch { return { tracks: [] }; }
+}
+
+// Resolve a direct audio stream URL via yt-dlp (~1-3s). Returns null on failure.
+async function ytmStreamUrl(videoId) {
+  if (!_ytmServiceUrl) return null;
+  try {
+    const r = await fetch(`${_ytmServiceUrl}/stream/${encodeURIComponent(videoId)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data.url || null;
+  } catch { return null; }
+}
+
+// Play a single YTM track: resolve its stream URL, then hand the raw googlevideo
+// URL to the speaker via HA play_media. A different source from Jellyfin, so we
+// clear the Jellyfin now-playing art id and card-side queue. Returns true on
+// success. yt-dlp prefers m4a/AAC, which Sonos plays natively.
+async function playYtmTrack(hass, eid, videoId) {
+  if (!hass || !eid || !videoId) return false;
+  const url = await ytmStreamUrl(videoId);
+  if (!url) { console.error('[smc] YTM stream resolve failed'); return false; }
+  _smcNowPlayingJfId = null;   // different source — drop Jellyfin art
+  _smcQueue = [];              // different source — drop Jellyfin queue
+  _smcQueueEntityId = null;
+  try {
+    await hass.callService('media_player', 'play_media', {
+      entity_id: eid,
+      media_content_id: url,
+      media_content_type: 'music',
+    });
+    return true;
+  } catch (err) {
+    console.error('[smc] YTM play failed:', err);
+    return false;
+  }
+}
+
 // Index of a featuring marker in an artist name, handling both spellings
 // Jellyfin uses: " feat." and " featuring ". Returns the earliest, or -1.
 function getFeatIndex(name) {
@@ -354,6 +415,7 @@ const IconShuffle = () => html`<svg width="16" height="16" viewBox="0 0 24 24" f
 const IconRepeat = () => html`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>`;
 const IconChevron = () => html`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`;
 const IconMusicNote = () => html`<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
+const IconYTM = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M23.5 6.19a3.02 3.02 0 0 0-2.12-2.14C19.54 3.5 12 3.5 12 3.5s-7.54 0-9.38.55A3.02 3.02 0 0 0 .5 6.19C0 8.04 0 12 0 12s0 3.96.5 5.81a3.02 3.02 0 0 0 2.12 2.14C4.46 20.5 12 20.5 12 20.5s7.54 0 9.38-.55a3.02 3.02 0 0 0 2.12-2.14C24 15.96 24 12 24 12s0-3.96-.5-5.81zM9.75 15.5v-7l6.5 3.5-6.5 3.5z"/></svg>`;
 
 // ── Styles ──────────────────────────────────────────────────────
 const cardStyles = `
@@ -462,6 +524,7 @@ const cardStyles = `
     background: ${THEME.base};
     display: flex; gap: 6px; padding: 12px 16px 8px;
     flex-shrink: 0; z-index: 3;
+    flex-wrap: wrap;   /* 6 tabs: wrap to a second row on narrow cards */
   }
   .smc-nav-item {
     display: flex; align-items: center; gap: 5px;
@@ -694,6 +757,37 @@ const cardStyles = `
   }
   .smc-action-btn:active { opacity: 0.75; }
   .smc-action-btn:disabled { opacity: 0.5; cursor: default; }
+
+  /* ── YTM type-filter pills ── */
+  .smc-pill-bar {
+    display: flex; gap: 8px; padding: 0 16px 8px; flex-shrink: 0;
+  }
+  .smc-pill {
+    padding: 5px 14px;
+    border-radius: 16px;
+    border: 1px solid #2e2e2e;
+    background: #1c1c1c;
+    color: #737373;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .smc-pill.active {
+    background: #3b82f6;
+    border-color: #3b82f6;
+    color: #fff;
+  }
+  .smc-pill:active { opacity: 0.75; }
+  /* per-row stream-resolve spinner */
+  .smc-row-spinner {
+    width: 16px; height: 16px; flex-shrink: 0;
+    border: 2px solid #2e2e2e;
+    border-top-color: ${THEME.primary};
+    border-radius: 50%;
+    animation: smc-spin 0.7s linear infinite;
+  }
+  @keyframes smc-spin { to { transform: rotate(360deg); } }
 
   /* ── Queue tab ── */
   .smc-queue-count {
@@ -1243,6 +1337,229 @@ function SearchView({ hass, selectedSpeakers, onTabChange }) {
   `;
 }
 
+// ── YouTube Music View (ytm-service) ────────────────────────────
+function YTMView({ hass, selectedSpeakers, onTabChange }) {
+  const [q, setQ] = useState('');
+  const [type, setType] = useState('songs');      // songs | albums | artists
+  const [results, setResults] = useState(null);   // [{type, id, title, artist, album, thumbnail}] | null
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState(null);
+  // Album drill — null = show search results.
+  const [album, setAlbum] = useState(null);        // { id, title, artist }
+  const [albumTracks, setAlbumTracks] = useState([]);
+  const [albumLoading, setAlbumLoading] = useState(false);
+  const [albumError, setAlbumError] = useState(null);
+  const [loadingId, setLoadingId] = useState(null); // videoId currently resolving
+  const [addState, setAddState] = useState(null);
+  const hassRef = useRef(hass);
+  hassRef.current = hass;
+  const eid = selectedSpeakers[0];
+  const debounceRef = useRef(null);
+
+  // Debounced search (400ms), re-runs on query or type change. Empty clears.
+  useEffect(() => {
+    if (!eid || !_ytmServiceUrl) return;
+    const term = q.trim();
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (!term) { setResults(null); setSearchError(null); setSearching(false); return; }
+    let cancelled = false;
+    debounceRef.current = setTimeout(async () => {
+      setSearching(true); setSearchError(null);
+      try {
+        const data = await ytmSearch(term, type);
+        if (!cancelled) setResults(data.results || []);
+      } catch (e) {
+        if (!cancelled) setSearchError(e?.message || String(e));
+      } finally {
+        if (!cancelled) setSearching(false);
+      }
+    }, 400);
+    return () => { cancelled = true; if (debounceRef.current) clearTimeout(debounceRef.current); };
+  }, [q, type, eid]);
+
+  // Album drill fetch.
+  useEffect(() => {
+    if (!album || !_ytmServiceUrl) return;
+    let cancelled = false;
+    (async () => {
+      setAlbumLoading(true); setAlbumError(null);
+      try {
+        const data = await ytmAlbumTracks(album.id);
+        if (!cancelled) setAlbumTracks(data.tracks || []);
+      } catch (e) {
+        if (!cancelled) setAlbumError(e?.message || String(e));
+      } finally {
+        if (!cancelled) setAlbumLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [album]);
+
+  // Tap a song row: resolve its stream (spinner on the row), play, jump to Now Playing.
+  const tapSong = useCallback(async (videoId) => {
+    if (loadingId) return;                 // one resolve at a time
+    setLoadingId(videoId);
+    const ok = await playYtmTrack(hassRef.current, eid, videoId);
+    setLoadingId(null);
+    if (ok && onTabChange) onTabChange('playing');
+  }, [eid, loadingId, onTabChange]);
+
+  // Album Play All: play the first track now, background-enqueue the rest. Each
+  // track needs its own yt-dlp resolve (~1-3s), so the rest stream in over time.
+  const playAlbumAll = useCallback(async () => {
+    const ids = albumTracks.map(t => t.id).filter(Boolean);
+    if (!ids.length) return;
+    setAddState('starting');
+    const ok = await playYtmTrack(hassRef.current, eid, ids[0]);
+    if (!ok) { setAddState(null); return; }
+    if (onTabChange) onTabChange('playing');
+    setAddState(null);
+    // Fire-and-forget: resolve + append the remaining tracks in order.
+    (async () => {
+      for (let i = 1; i < ids.length; i++) {
+        const url = await ytmStreamUrl(ids[i]);
+        if (!url) continue;
+        try {
+          await hassRef.current.callService('media_player', 'play_media', {
+            entity_id: eid, media_content_id: url, media_content_type: 'music', enqueue: 'add',
+          });
+        } catch { break; }
+      }
+    })();
+  }, [albumTracks, eid, onTabChange]);
+
+  const onInput = useCallback((e) => {
+    setQ(e.target.value);
+    setAlbum(a => (a ? null : a));   // editing query drops out of album drill
+  }, []);
+
+  if (!eid) {
+    return html`<div class="smc-content"><p class="smc-header">YouTube Music</p><p class="smc-error">Select a speaker first</p></div>`;
+  }
+  if (!_ytmServiceUrl) {
+    return html`<div class="smc-content"><p class="smc-header">YouTube Music</p>
+      <p class="smc-error">YTM service not configured — set <code>ytm_url</code> in the card config.</p></div>`;
+  }
+
+  const thumb = (url, fallback) => url
+    ? html`<img class="smc-browse-thumb" src=${url} alt="" loading="eager" referrerpolicy="no-referrer" />`
+    : html`<div class="smc-browse-thumb-placeholder">${fallback}</div>`;
+
+  const searchBox = html`
+    <div class="smc-search-box">
+      <input class="smc-search-input" type="search" value=${q}
+        placeholder="Search YouTube Music…" onInput=${onInput} />
+    </div>
+    <div class="smc-pill-bar">
+      ${[['songs', 'Songs'], ['albums', 'Albums'], ['artists', 'Artists']].map(([id, label]) => html`
+        <button key=${id} class=${`smc-pill${type === id ? ' active' : ''}`}
+          onClick=${() => { setType(id); setAlbum(null); }}>${label}</button>
+      `)}
+    </div>
+  `;
+
+  // Album drill view.
+  if (album) {
+    return html`
+      ${searchBox}
+      <div class="smc-content">
+        <div class="smc-breadcrumb">
+          <span class="smc-breadcrumb-item" onClick=${() => setAlbum(null)}>Results</span>
+          <span class="smc-breadcrumb-sep">›</span>
+          <span class="smc-breadcrumb-item current">${album.title}</span>
+        </div>
+        ${!albumLoading && !albumError && albumTracks.length > 0 && html`
+          <div class="smc-action-bar">
+            <button class="smc-action-btn primary" disabled=${addState === 'starting'} onClick=${playAlbumAll}>
+              ${addState === 'starting' ? 'Starting…' : '▶ Play All'}
+            </button>
+          </div>
+        `}
+        ${albumLoading && html`<p class="smc-loading">Loading…</p>`}
+        ${albumError && html`<p class="smc-error">${albumError}</p>`}
+        ${!albumLoading && !albumError && html`
+          <div class="smc-browse-list">
+            ${albumTracks.length === 0 && html`<p class="smc-loading">No tracks found</p>`}
+            ${albumTracks.map(t => html`
+              <div key=${t.id} class="smc-browse-row" onClick=${() => tapSong(t.id)}>
+                ${thumb(t.thumbnail, '♪')}
+                <div class="smc-browse-info">
+                  <p class="smc-browse-title">${t.title}</p>
+                  ${t.artist && html`<p class="smc-browse-subtitle">${t.artist}</p>`}
+                </div>
+                ${loadingId === t.id && html`<div class="smc-row-spinner"></div>`}
+              </div>
+            `)}
+          </div>
+        `}
+      </div>
+    `;
+  }
+
+  // Initial / empty state.
+  if (!searching && !searchError && !results) {
+    return html`
+      ${searchBox}
+      <div class="smc-search-empty">Search YouTube Music</div>
+    `;
+  }
+
+  // Results view.
+  return html`
+    ${searchBox}
+    <div class="smc-content">
+      ${searching && html`<p class="smc-loading">Searching…</p>`}
+      ${searchError && html`<p class="smc-error">${searchError}</p>`}
+      ${!searching && !searchError && results && results.length === 0 && html`
+        <div class="smc-search-empty">No results</div>
+      `}
+      ${!searching && !searchError && results && results.length > 0 && html`
+        <div class="smc-browse-list">
+          ${results.map(r => {
+            if (r.type === 'songs') {
+              return html`
+                <div key=${r.id} class="smc-browse-row" onClick=${() => tapSong(r.id)}>
+                  ${thumb(r.thumbnail, '♪')}
+                  <div class="smc-browse-info">
+                    <p class="smc-browse-title">${r.title}</p>
+                    ${r.artist && html`<p class="smc-browse-subtitle">${r.artist}</p>`}
+                  </div>
+                  ${loadingId === r.id && html`<div class="smc-row-spinner"></div>`}
+                </div>
+              `;
+            }
+            if (r.type === 'albums') {
+              return html`
+                <div key=${r.id} class="smc-browse-row"
+                  onClick=${() => setAlbum({ id: r.id, title: r.title, artist: r.artist })}>
+                  ${thumb(r.thumbnail, '\u{1F4BF}')}
+                  <div class="smc-browse-info">
+                    <p class="smc-browse-title">${r.title}</p>
+                    ${r.artist && html`<p class="smc-browse-subtitle">${r.artist}</p>`}
+                  </div>
+                  <span class="smc-browse-chevron">›</span>
+                </div>
+              `;
+            }
+            // artists — tap searches that artist's songs.
+            return html`
+              <div key=${r.id} class="smc-browse-row"
+                onClick=${() => { setType('songs'); setQ(r.title); }}>
+                ${thumb(r.thumbnail, '\u{1F3A4}')}
+                <div class="smc-browse-info">
+                  <p class="smc-browse-title">${r.title}</p>
+                  <p class="smc-browse-subtitle">Artist</p>
+                </div>
+                <span class="smc-browse-chevron">›</span>
+              </div>
+            `;
+          })}
+        </div>
+      `}
+    </div>
+  `;
+}
+
 // ── Queue View (card-side queue — Branch B) ─────────────────────
 function QueueView({ hass, selectedSpeakers, onTabChange }) {
   const hassRef = useRef(hass);
@@ -1507,6 +1824,7 @@ function BottomNav({ activeTab, onTabChange }) {
     { id: 'search', label: 'Search', icon: IconSearch },
     { id: 'browse', label: 'Browse', icon: IconBrowse },
     { id: 'queue', label: 'Queue', icon: IconQueue },
+    { id: 'ytm', label: 'YTM', icon: IconYTM },
     { id: 'playing', label: 'Now Playing', icon: IconNowPlaying },
   ];
   return html`
@@ -1673,6 +1991,9 @@ function SonosMusicApp({ hass, config }) {
       <div class=${`smc-tab-panel${activeTab !== 'queue' ? ' hidden' : ''}`}>
         <${QueueView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
       </div>
+      <div class=${`smc-tab-panel${activeTab !== 'ytm' ? ' hidden' : ''}`}>
+        <${YTMView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
+      </div>
       <div class=${`smc-tab-panel${activeTab !== 'playing' ? ' hidden' : ''}`}>
         <${NowPlayingView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
       </div>
@@ -1707,6 +2028,7 @@ class SonosMusicCard extends HTMLElement {
     _jellyfinInternalUrl = strip(config.jellyfin_internal_url) || _jellyfinUrl;
     _jellyfinToken = config.jellyfin_token || null;
     _jellyfinUserId = null;
+    _ytmServiceUrl = strip(config.ytm_url) || 'https://ska.hq.stylee.org/ytm';
   }
   _init() {
     this._root = this.attachShadow({ mode: 'open' });
