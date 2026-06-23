@@ -197,6 +197,18 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.16.5** — Fixed Sonos UPnP Error 714 "Illegal MIME-Type" on the
+**YouTube Music** path. The card handed Sonos the raw, extensionless
+googlevideo URL; HA's Sonos integration infers the UPnP `protocolInfo` MIME
+from the URL path extension, got nothing, and Sonos rejected
+`SetAVTransportURI` with 714 — before fetching a byte. Fix: new `ytm-service`
+endpoint `GET /ytm/audio/<videoId>.m4a` that 302-redirects to the resolved
+googlevideo URL; the `.m4a` path lets HA infer `audio/mp4`. The card now plays
+`${_ytmServiceUrl}/audio/<videoId>.m4a` directly in `playYtmTrack`, `onYtmJump`,
+and the Play All enqueue loop — no client-side resolve. `ytmStreamUrl` (hits
+`/ytm/stream/`) is retained but now unused by the card. If the 302 fails on any
+Sonos model, the fallback is a full streaming proxy at the same endpoint.
+
 **v0.16.4** — Fixed Sonos UPnP Error 714 "Illegal MIME-Type" on `play_media`.
 `jfStreamUrl` was missing `&Container=mp3`, so Jellyfin did not reliably set
 `Content-Type: audio/mpeg` and Sonos rejected the stream with a 714. Added

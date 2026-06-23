@@ -1,4 +1,4 @@
-// Sonos Music Card v0.16.4
+// Sonos Music Card v0.16.5
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -342,8 +342,8 @@ async function ytmStreamUrl(videoId) {
 // success. yt-dlp prefers m4a/AAC, which Sonos plays natively.
 async function playYtmTrack(hass, eid, videoId, meta = {}, queue = null) {
   if (!hass || !eid || !videoId) return false;
-  const url = await ytmStreamUrl(videoId);
-  if (!url) { console.error('[smc] YTM stream resolve failed'); return false; }
+  if (!_ytmServiceUrl) { console.error('[smc] YTM service URL not configured'); return false; }
+  const url = `${_ytmServiceUrl}/audio/${encodeURIComponent(videoId)}.m4a`;
   // HA reports the raw stream URL as media_title for YTM tracks, so stash the
   // real title/artist/art to substitute in Now Playing (see buildNpInfo).
   _ytmNowPlaying = { videoId, title: meta.title || null, artist: meta.artist || null, thumbnail: meta.thumbnail || null };
@@ -1475,8 +1475,7 @@ function YTMView({ hass, selectedSpeakers, onTabChange }) {
     // Fire-and-forget: resolve + append the remaining tracks in order.
     (async () => {
       for (let i = 1; i < ids.length; i++) {
-        const url = await ytmStreamUrl(ids[i]);
-        if (!url) continue;
+        const url = `${_ytmServiceUrl}/audio/${encodeURIComponent(ids[i])}.m4a`;
         try {
           await hassRef.current.callService('media_player', 'play_media', {
             entity_id: eid, media_content_id: url, media_content_type: 'music', enqueue: 'add',
@@ -1646,17 +1645,16 @@ function QueueView({ hass, selectedSpeakers, onTabChange }) {
   // the YTM queue (unlike playYtmTrack, which rebuilds it).
   const onYtmJump = useCallback(async (track) => {
     if (!hassRef.current || !eid || loadingId) return;
+    const url = `${_ytmServiceUrl}/audio/${encodeURIComponent(track.videoId)}.m4a`;
     setLoadingId(track.videoId);
-    const url = await ytmStreamUrl(track.videoId);
-    setLoadingId(null);
-    if (!url) return;
     _ytmNowPlaying = { videoId: track.videoId, title: track.title, artist: track.artist, thumbnail: track.thumbnail };
     _ytmDirty = true;
     try {
       await hassRef.current.callService('media_player', 'play_media', {
         entity_id: eid, media_content_id: url, media_content_type: 'music',
       });
-    } catch (err) { console.error('[smc] YTM queue jump failed:', err); return; }
+    } catch (err) { console.error('[smc] YTM queue jump failed:', err); setLoadingId(null); return; }
+    setLoadingId(null);
     force(n => n + 1);
   }, [eid, loadingId]);
 
