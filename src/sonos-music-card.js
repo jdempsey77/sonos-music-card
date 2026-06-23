@@ -1,4 +1,4 @@
-// Sonos Music Card v0.15.0
+// Sonos Music Card v0.15.1
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -267,13 +267,25 @@ async function jfArtistTracks(artistId) {
   return out;
 }
 
+// Index of a featuring marker in an artist name, handling both spellings
+// Jellyfin uses: " feat." and " featuring ". Returns the earliest, or -1.
+function getFeatIndex(name) {
+  const lower = name.toLowerCase();
+  const i1 = lower.indexOf(' feat.');
+  const i2 = lower.indexOf(' featuring ');
+  if (i1 === -1 && i2 === -1) return -1;
+  if (i1 === -1) return i2;
+  if (i2 === -1) return i1;
+  return Math.min(i1, i2);
+}
+
 // Collapse "Artist feat. X" variants under the base artist so the Artists list
 // isn't polluted by featuring credits.
 function collapseFeaturingArtists(artists) {
   const base = new Map(); // baseName -> row
   const result = [];
   for (const a of artists) {
-    const featIdx = a.name.toLowerCase().indexOf(' feat.');
+    const featIdx = getFeatIndex(a.name);
     if (featIdx !== -1) {
       const baseName = a.name.slice(0, featIdx).trim();
       if (base.has(baseName)) {

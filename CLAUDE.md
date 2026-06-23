@@ -196,9 +196,11 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
-**v0.15.0** — Queue tab (card-side queue, read-only + tap-to-jump), Play All /
-Add All at album & artist drill levels, and "Artist feat. X" collapse in Browse >
-Artists. `playJfTracks()` is now metadata-aware (takes queue items, not bare ids).
+**v0.15.1** — Hotfix: artist collapse now handles both "Artist feat. X" and
+"Artist featuring X" (Jellyfin uses both spellings) via `getFeatIndex()`.
+v0.15.0 added the Queue tab (card-side queue, read-only + tap-to-jump), Play All /
+Add All at album & artist drill levels, and the initial "feat." collapse.
+`playJfTracks()` is metadata-aware (takes queue items, not bare ids).
 Check top of `src/sonos-music-card.js` for the exact version comment.
 
 ## Open work
