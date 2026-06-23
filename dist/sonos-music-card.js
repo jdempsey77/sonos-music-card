@@ -1,4 +1,4 @@
-// Sonos Music Card v0.16.0
+// Sonos Music Card v0.16.1
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -29,6 +29,11 @@ let _ytmServiceUrl = null;        // browser-facing base, e.g. https://ska.hq.st
 // reflect Jellyfin cover art back through HA (entity_picture is null), so we
 // use this to source the Now Playing art ourselves. Cleared when idle.
 let _smcNowPlayingJfId = null;
+
+// YTM now-playing metadata — set when a YTM track starts, cleared when Jellyfin
+// playback starts or the player goes idle. HA reports the raw stream URL as
+// media_title for YTM tracks, so we substitute this in buildNpInfo().
+let _ytmNowPlaying = null;  // {title, artist, thumbnail} | null
 
 // ── Card-side queue (Branch B) ──────────────────────────────────
 // HA exposes no full-queue read for these entities: the card's configured
@@ -189,6 +194,7 @@ function toQueueItem(t) {
 // queue (a fresh "play" replaces it — see Branch B note above).
 async function playJfTracks(hass, eid, tracks, startIndex = 0) {
   if (!hass || !eid || !tracks?.length) return;
+  _ytmNowPlaying = null;  // clear YTM metadata — Jellyfin is now the source
   const slice = tracks.slice(startIndex);
   const ids = slice.map(t => t.id);
   try {
@@ -308,10 +314,13 @@ async function ytmStreamUrl(videoId) {
 // URL to the speaker via HA play_media. A different source from Jellyfin, so we
 // clear the Jellyfin now-playing art id and card-side queue. Returns true on
 // success. yt-dlp prefers m4a/AAC, which Sonos plays natively.
-async function playYtmTrack(hass, eid, videoId) {
+async function playYtmTrack(hass, eid, videoId, meta = {}) {
   if (!hass || !eid || !videoId) return false;
   const url = await ytmStreamUrl(videoId);
   if (!url) { console.error('[smc] YTM stream resolve failed'); return false; }
+  // HA reports the raw stream URL as media_title for YTM tracks, so stash the
+  // real title/artist/art to substitute in Now Playing (see buildNpInfo).
+  _ytmNowPlaying = { title: meta.title || null, artist: meta.artist || null, thumbnail: meta.thumbnail || null };
   _smcNowPlayingJfId = null;   // different source — drop Jellyfin art
   _smcQueue = [];              // different source — drop Jellyfin queue
   _smcQueueEntityId = null;
@@ -814,7 +823,7 @@ function buildNpInfo(id, state) {
     ? a.media_duration : 0;
   const position = (a.media_position >= 0 && a.media_position <= duration)
     ? a.media_position : 0;
-  return {
+  const info = {
     entityId: id,
     title: a.media_title || 'Unknown',
     artist: a.media_artist || '',
@@ -829,6 +838,16 @@ function buildNpInfo(id, state) {
     shuffle: !!a.shuffle,
     repeat: a.repeat || 'off',
   };
+
+  // HA reports the raw stream URL as media_title for YTM tracks. Substitute the
+  // stored metadata when we have it and the title looks like a URL (not a name).
+  if (_ytmNowPlaying && (!a.media_title || info.title.includes('videoplayback') || info.title.startsWith('http'))) {
+    info.title = _ytmNowPlaying.title || info.title;
+    info.artist = _ytmNowPlaying.artist || info.artist;
+    info.art = info.art || _ytmNowPlaying.thumbnail || null;
+  }
+
+  return info;
 }
 
 // True if a speaker is playing from a non-queue source (TV, line-in, AirPlay).
@@ -884,8 +903,10 @@ function getNowPlaying(hass, selectedSpeakers) {
     const state = hass.states[id];
     if (state && hasMediaContext(state)) return buildNpInfo(id, state);
   }
-  // Nothing playing/paused anywhere — player is idle, drop the stored art id.
+  // Nothing playing/paused anywhere — player is idle, drop the stored art id
+  // and YTM metadata.
   _smcNowPlayingJfId = null;
+  _ytmNowPlaying = null;
   return null;
 }
 
@@ -1395,11 +1416,12 @@ function YTMView({ hass, selectedSpeakers, onTabChange }) {
     return () => { cancelled = true; };
   }, [album]);
 
-  // Tap a song row: resolve its stream (spinner on the row), play, jump to Now Playing.
-  const tapSong = useCallback(async (videoId) => {
+  // Tap a song row: resolve its stream (spinner on the row), play, jump to Now
+  // Playing. `track` carries {id, title, artist, thumbnail} for Now Playing.
+  const tapSong = useCallback(async (track) => {
     if (loadingId) return;                 // one resolve at a time
-    setLoadingId(videoId);
-    const ok = await playYtmTrack(hassRef.current, eid, videoId);
+    setLoadingId(track.id);
+    const ok = await playYtmTrack(hassRef.current, eid, track.id, track);
     setLoadingId(null);
     if (ok && onTabChange) onTabChange('playing');
   }, [eid, loadingId, onTabChange]);
@@ -1410,7 +1432,8 @@ function YTMView({ hass, selectedSpeakers, onTabChange }) {
     const ids = albumTracks.map(t => t.id).filter(Boolean);
     if (!ids.length) return;
     setAddState('starting');
-    const ok = await playYtmTrack(hassRef.current, eid, ids[0]);
+    const first = albumTracks.find(t => t.id === ids[0]);
+    const ok = await playYtmTrack(hassRef.current, eid, ids[0], first || {});
     if (!ok) { setAddState(null); return; }
     if (onTabChange) onTabChange('playing');
     setAddState(null);
@@ -1481,7 +1504,7 @@ function YTMView({ hass, selectedSpeakers, onTabChange }) {
           <div class="smc-browse-list">
             ${albumTracks.length === 0 && html`<p class="smc-loading">No tracks found</p>`}
             ${albumTracks.map(t => html`
-              <div key=${t.id} class="smc-browse-row" onClick=${() => tapSong(t.id)}>
+              <div key=${t.id} class="smc-browse-row" onClick=${() => tapSong(t)}>
                 ${thumb(t.thumbnail, '♪')}
                 <div class="smc-browse-info">
                   <p class="smc-browse-title">${t.title}</p>
@@ -1518,7 +1541,7 @@ function YTMView({ hass, selectedSpeakers, onTabChange }) {
           ${results.map(r => {
             if (r.type === 'songs') {
               return html`
-                <div key=${r.id} class="smc-browse-row" onClick=${() => tapSong(r.id)}>
+                <div key=${r.id} class="smc-browse-row" onClick=${() => tapSong(r)}>
                   ${thumb(r.thumbnail, '♪')}
                   <div class="smc-browse-info">
                     <p class="smc-browse-title">${r.title}</p>

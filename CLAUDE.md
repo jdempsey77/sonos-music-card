@@ -197,6 +197,14 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.16.1** — YTM Now Playing fix. HA reports the raw `videoplayback?expire=…`
+stream URL as `media_title` for YTM tracks, so Now Playing showed a URL and a
+placeholder. New module var `_ytmNowPlaying` ({title, artist, thumbnail}) is set
+in `playYtmTrack()` (metadata threaded from the tapped row), cleared in
+`playJfTracks()` and when the player goes idle. `buildNpInfo()` substitutes it
+when `media_title` is missing or looks like a URL (`includes('videoplayback')`
+or `startsWith('http')`). `playYtmTrack(hass, eid, videoId, meta)` now takes a
+meta object; `tapSong(track)` and album Play All pass the full row object.
 **v0.16.0** — YouTube Music tab. New `YTMView` (6th nav tab) backed by
 `ytm-service` on ska (ytmusicapi search + yt-dlp stream resolution, exposed at
 `ska.hq.stylee.org/ytm/`). Search songs/albums/artists, drill into albums,
@@ -240,7 +248,7 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [ ] Queue reorder / delete (Queue tab is read-only this version)
 - [ ] Art that tracks queue advance (currently shows first track's art only)
 - [ ] Direct-play (avoid mp3 transcode) for lossless on capable renderers
-- [ ] YTM Now Playing art (raw stream URL has no cover; HA gives no entity_picture)
+- [x] YTM Now Playing title/artist/art — v0.16.1 (`_ytmNowPlaying` + buildNpInfo substitution)
 - [ ] YTM card-side queue (YTM playback clears `_smcQueue`; Queue tab empty for YTM)
 
 ## Session startup checklist
