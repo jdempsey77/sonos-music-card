@@ -197,6 +197,13 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.16.3** — YTM track changes now re-render the UI immediately. `_ytmNowPlaying`
+is module-level state, so updating it didn't trigger a Preact render — the UI
+showed the previous track until some hass update happened to re-render. Added a
+`_ytmDirty` flag (mirrors the existing `_smcDirty`/`forceUpdate` pattern): set
+`true` wherever `_ytmNowPlaying` changes (`playYtmTrack`, QueueView YTM jump, and
+on clear in `playJfTracks`), checked+consumed in `SonosMusicApp` to bump the
+shared `forceUpdate` counter.
 **v0.16.2** — Two YTM fixes. (1) YTM Now Playing no longer reverts to the raw URL
 on idle/pause: `getNowPlaying()` no longer clears `_ytmNowPlaying` (it's cleared
 only in `playJfTracks()` when Jellyfin takes over; `buildNpInfo`'s URL guard keeps

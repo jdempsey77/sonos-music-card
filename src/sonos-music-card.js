@@ -1,4 +1,4 @@
-// Sonos Music Card v0.16.2
+// Sonos Music Card v0.16.3
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -218,6 +218,7 @@ function toQueueItem(t) {
 async function playJfTracks(hass, eid, tracks, startIndex = 0) {
   if (!hass || !eid || !tracks?.length) return;
   _ytmNowPlaying = null;        // clear YTM metadata — Jellyfin is now the source
+  _ytmDirty = true;
   _ytmQueue = [];
   _ytmQueueEntityId = null;
   const slice = tracks.slice(startIndex);
@@ -346,6 +347,7 @@ async function playYtmTrack(hass, eid, videoId, meta = {}, queue = null) {
   // HA reports the raw stream URL as media_title for YTM tracks, so stash the
   // real title/artist/art to substitute in Now Playing (see buildNpInfo).
   _ytmNowPlaying = { videoId, title: meta.title || null, artist: meta.artist || null, thumbnail: meta.thumbnail || null };
+  _ytmDirty = true;
   // Populate the YTM queue: the full album list if given (Play All), else this
   // one track (single tap). We don't pre-resolve the album — yt-dlp is ~1-3s per
   // track — so the queue is metadata-only; tracks stream in via enqueue.
@@ -1649,6 +1651,7 @@ function QueueView({ hass, selectedSpeakers, onTabChange }) {
     setLoadingId(null);
     if (!url) return;
     _ytmNowPlaying = { videoId: track.videoId, title: track.title, artist: track.artist, thumbnail: track.thumbnail };
+    _ytmDirty = true;
     try {
       await hassRef.current.callService('media_player', 'play_media', {
         entity_id: eid, media_content_id: url, media_content_type: 'music',
@@ -1931,6 +1934,7 @@ function BottomNav({ activeTab, onTabChange }) {
 const SMC_KEY = 'smc_selected_speakers';
 let _smcSpeakers = []; // THE selected speakers — single source of truth
 let _smcDirty = false; // set when smcAutoDetect changes _smcSpeakers
+let _ytmDirty = false; // set when _ytmNowPlaying changes — signals Preact to re-render
 let _smcUserSelected = false; // true after explicit user tap — blocks auto-detect
 let _smcUserSelectedAt = 0; // timestamp of last user tap
 
@@ -2023,6 +2027,12 @@ function SonosMusicApp({ hass, config }) {
   // Sync auto-detected speaker changes into Preact render cycle
   if (_smcDirty) {
     _smcDirty = false;
+    setTimeout(() => forceUpdate(n => n + 1), 0);
+  }
+
+  // Sync YTM now-playing changes (module-level, no hass update) into render cycle
+  if (_ytmDirty) {
+    _ytmDirty = false;
     setTimeout(() => forceUpdate(n => n + 1), 0);
   }
 
