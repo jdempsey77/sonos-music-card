@@ -1,4 +1,4 @@
-// Sonos Music Card v0.14.0
+// Sonos Music Card v0.15.0
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -22,6 +22,15 @@ let _jellyfinUserId = null;
 // reflect Jellyfin cover art back through HA (entity_picture is null), so we
 // use this to source the Now Playing art ourselves. Cleared when idle.
 let _smcNowPlayingJfId = null;
+
+// ── Card-side queue (Branch B) ──────────────────────────────────
+// HA exposes no full-queue read for these entities: the card's configured
+// speakers are music_assistant-platform entities (sonos.get_queue rejects them),
+// and music_assistant.get_queue returns only current_item + next_item with null
+// images — not the full list. So we track what WE enqueue ourselves. The Queue
+// tab reads these directly; no API call needed.
+let _smcQueue = [];           // [{id, name, subtitle, imageTag}] — tracks we enqueued
+let _smcQueueEntityId = null; // which speaker the queue belongs to (scopes validity)
 
 // GET against the Jellyfin API. Auth via api_key query param (not a custom
 // header) so the browser issues a simple CORS GET with no preflight.
@@ -94,11 +103,11 @@ async function jfFetchRows(frame) {
       ];
     case 'artists': {
       const data = await jfGet(`/Artists?ParentId=${frame.libId}&Recursive=true&SortBy=SortName&SortOrder=Ascending&Limit=2000&UserId=${uid}`);
-      return (data?.Items || []).map(a => ({
+      return collapseFeaturingArtists((data?.Items || []).map(a => ({
         id: a.Id, name: a.Name, subtitle: 'Artist',
         imageTag: a.ImageTags?.Primary,
         next: { kind: 'artist', title: a.Name, artistId: a.Id },
-      }));
+      })));
     }
     case 'albums': {
       const data = await jfGet(`/Items?ParentId=${frame.libId}&IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=SortName&SortOrder=Ascending&Limit=2000&UserId=${uid}`);
@@ -161,12 +170,20 @@ async function jfSearch(term) {
   };
 }
 
-// Play a list of Jellyfin tracks from startIndex via HA. First track replaces
-// the queue; the rest are appended best-effort (Sonos supports enqueue=add).
-// Sets _smcNowPlayingJfId so Now Playing can source cover art from Jellyfin.
-async function playJfTracks(hass, eid, trackIds, startIndex) {
-  if (!hass || !eid || !trackIds?.length) return;
-  const ids = trackIds.slice(startIndex);
+// Normalize a track to the card-side queue shape.
+function toQueueItem(t) {
+  return { id: t.id, name: t.name, subtitle: t.subtitle || '', imageTag: t.imageTag || null };
+}
+
+// Play a list of Jellyfin tracks from startIndex via HA. `tracks` is an array of
+// {id, name, subtitle, imageTag}. The first track replaces the queue; the rest
+// are appended best-effort (Sonos supports enqueue=add). Sets _smcNowPlayingJfId
+// so Now Playing can source cover art from Jellyfin, and rebuilds the card-side
+// queue (a fresh "play" replaces it — see Branch B note above).
+async function playJfTracks(hass, eid, tracks, startIndex = 0) {
+  if (!hass || !eid || !tracks?.length) return;
+  const slice = tracks.slice(startIndex);
+  const ids = slice.map(t => t.id);
   try {
     await hass.callService('media_player', 'play_media', {
       entity_id: eid,
@@ -174,6 +191,8 @@ async function playJfTracks(hass, eid, trackIds, startIndex) {
       media_content_type: 'music',
     });
     _smcNowPlayingJfId = ids[0];
+    _smcQueue = slice.map(toQueueItem);
+    _smcQueueEntityId = eid;
   } catch (err) {
     console.error('[smc] play failed:', err);
     return;
@@ -188,6 +207,97 @@ async function playJfTracks(hass, eid, trackIds, startIndex) {
       });
     } catch { break; }
   }
+}
+
+// Append tracks to the current queue without interrupting playback (enqueue=add).
+// Mirrors the appended tracks into the card-side queue. Returns the count added.
+async function enqueueJfTracks(hass, eid, tracks) {
+  if (!hass || !eid || !tracks?.length) return 0;
+  // If the card-side queue is for a different speaker, this enqueue starts a
+  // fresh card-side queue scoped to eid.
+  if (_smcQueueEntityId !== eid) { _smcQueue = []; _smcQueueEntityId = eid; }
+  let added = 0;
+  for (const t of tracks) {
+    try {
+      await hass.callService('media_player', 'play_media', {
+        entity_id: eid,
+        media_content_id: jfStreamUrl(t.id),
+        media_content_type: 'music',
+        enqueue: 'add',
+      });
+      _smcQueue.push(toQueueItem(t));
+      added++;
+    } catch { break; }
+  }
+  return added;
+}
+
+// Jump to a queue track: play it immediately, replacing the current track (no
+// enqueue). Leaves the card-side queue list intact so the Queue tab still shows
+// it; updates the now-playing art id so the highlight follows.
+async function jumpToQueueTrack(hass, eid, track) {
+  if (!hass || !eid || !track) return;
+  try {
+    await hass.callService('media_player', 'play_media', {
+      entity_id: eid,
+      media_content_id: jfStreamUrl(track.id),
+      media_content_type: 'music',
+    });
+    _smcNowPlayingJfId = track.id;
+  } catch (err) { console.error('[smc] jump failed:', err); }
+}
+
+// Collect every track for an artist (all albums, in album order) as queue items.
+// Used by Play All / Add All at the artist drill level.
+async function jfArtistTracks(artistId) {
+  const uid = await jfGetUserId();
+  const albumsData = await jfGet(`/Items?AlbumArtistIds=${artistId}&IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=PremiereDate,ProductionYear,SortName&SortOrder=Descending&Limit=500&UserId=${uid}`);
+  const albums = albumsData?.Items || [];
+  const out = [];
+  for (const al of albums) {
+    const data = await jfGet(`/Items?ParentId=${al.Id}&IncludeItemTypes=Audio&SortBy=ParentIndexNumber,IndexNumber,SortName&Limit=500&UserId=${uid}`);
+    for (const t of (data?.Items || [])) {
+      out.push({
+        id: t.Id, name: t.Name,
+        subtitle: (t.Artists && t.Artists.join(', ')) || t.AlbumArtist || '',
+        imageTag: t.ImageTags?.Primary,
+      });
+    }
+  }
+  return out;
+}
+
+// Collapse "Artist feat. X" variants under the base artist so the Artists list
+// isn't polluted by featuring credits.
+function collapseFeaturingArtists(artists) {
+  const base = new Map(); // baseName -> row
+  const result = [];
+  for (const a of artists) {
+    const featIdx = a.name.toLowerCase().indexOf(' feat.');
+    if (featIdx !== -1) {
+      const baseName = a.name.slice(0, featIdx).trim();
+      if (base.has(baseName)) {
+        // silently drop — already have the base artist
+        continue;
+      }
+      // No base artist yet — keep but rename to base name
+      // (covers edge case: "2Pac feat. X" appears before "2Pac" in sorted list)
+      const collapsed = { ...a, name: baseName };
+      base.set(baseName, collapsed);
+      result.push(collapsed);
+    } else {
+      if (base.has(a.name)) {
+        // Base artist already added via a feat. entry — replace with the real entry
+        const idx = result.findIndex(r => r.id === base.get(a.name).id);
+        if (idx !== -1) result[idx] = a;
+        base.set(a.name, a);
+      } else {
+        base.set(a.name, a);
+        result.push(a);
+      }
+    }
+  }
+  return result;
 }
 
 // ── Theme tokens ────────────────────────────────────────────────
@@ -223,6 +333,7 @@ const IconSpeaker = () => html`<svg width="20" height="20" viewBox="0 0 24 24" f
 const IconBrowse = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>`;
 const IconNowPlaying = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
 const IconSearch = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>`;
+const IconQueue = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>`;
 const IconPlay = ({ size = 18 } = {}) => html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="5 3 19 12 5 21 5 3"/></svg>`;
 const IconPause = ({ size = 18 } = {}) => html`<svg width=${size} height=${size} viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>`;
 const IconPrev = () => html`<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="3" y="5" width="3" height="14"/><polygon points="21 5 9 12 21 19 21 5"/></svg>`;
@@ -545,6 +656,42 @@ const cardStyles = `
     color: #737373;
     font-size: 13px;
   }
+
+  /* ── Action bar (Play All / Add All) ── */
+  .smc-action-bar {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    padding: 0 8px 12px;
+  }
+  .smc-action-btn {
+    padding: 5px 14px;
+    border-radius: 16px;
+    border: 1px solid #2e2e2e;
+    background: #1c1c1c;
+    color: #e5e5e5;
+    font-size: 11px;
+    font-weight: 500;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  .smc-action-btn.primary {
+    background: #3b82f6;
+    border-color: #3b82f6;
+    color: #fff;
+  }
+  .smc-action-btn:active { opacity: 0.75; }
+  .smc-action-btn:disabled { opacity: 0.5; cursor: default; }
+
+  /* ── Queue tab ── */
+  .smc-queue-count {
+    font-size: 10px; color: ${THEME.statusMuted}; text-transform: uppercase;
+    letter-spacing: 0.1em; margin: 0 0 8px 4px;
+  }
+  .smc-browse-row.playing .smc-browse-title { color: ${THEME.primary}; font-weight: 600; }
+  .smc-queue-now {
+    color: ${THEME.primary}; flex-shrink: 0; display: flex; align-items: center;
+  }
 `;
 
 // ── Now-playing helpers ─────────────────────────────────────────
@@ -756,8 +903,33 @@ function BrowseView({ hass, selectedSpeakers }) {
   const push = useCallback((frame) => setStack(s => [...s, frame]), []);
   const gotoCrumb = useCallback((i) => setStack(s => s.slice(0, i + 1)), []);
 
-  const playList = useCallback((trackIds, startIndex) =>
-    playJfTracks(hassRef.current, eid, trackIds, startIndex), [eid]);
+  // Track rows in display order → queue items (album/playlist levels are all tracks).
+  const trackMeta = useMemo(() =>
+    rows.filter(r => r.track).map(r => ({ id: r.id, name: r.name, subtitle: r.subtitle, imageTag: r.imageTag })),
+  [rows]);
+
+  const playList = useCallback((startIndex) =>
+    playJfTracks(hassRef.current, eid, trackMeta, startIndex), [eid, trackMeta]);
+
+  // Play All / Add All — shown at album & artist drill levels.
+  const canActAll = current.kind === 'album' || current.kind === 'artist';
+  const [addState, setAddState] = useState(null); // null | 'adding' | 'Added N'
+  const collectTracks = useCallback(async () => {
+    if (current.kind === 'album') return trackMeta;
+    if (current.kind === 'artist') return await jfArtistTracks(current.artistId);
+    return [];
+  }, [current, trackMeta]);
+  const onPlayAll = useCallback(async () => {
+    const tracks = await collectTracks();
+    if (tracks.length) playJfTracks(hassRef.current, eid, tracks, 0);
+  }, [collectTracks, eid]);
+  const onAddAll = useCallback(async () => {
+    setAddState('adding');
+    const tracks = await collectTracks();
+    const n = await enqueueJfTracks(hassRef.current, eid, tracks);
+    setAddState(`Added ${n}`);
+    setTimeout(() => setAddState(null), 2000);
+  }, [collectTracks, eid]);
 
   if (!eid) {
     return html`<div class="smc-content"><p class="smc-header">Browse</p><p class="smc-error">Select a speaker first</p></div>`;
@@ -778,6 +950,14 @@ function BrowseView({ hass, selectedSpeakers }) {
           `)}
         </div>
       `}
+      ${canActAll && !loading && !error && html`
+        <div class="smc-action-bar">
+          <button class="smc-action-btn primary" onClick=${onPlayAll}>▶ Play All</button>
+          <button class="smc-action-btn" disabled=${addState === 'adding'} onClick=${onAddAll}>
+            ${addState === 'adding' ? 'Adding…' : (addState || '+ Add All')}
+          </button>
+        </div>
+      `}
       ${loading && html`<p class="smc-loading">Loading…</p>`}
       ${error && html`<p class="smc-error">${error}</p>`}
       ${!loading && !error && html`
@@ -786,7 +966,7 @@ function BrowseView({ hass, selectedSpeakers }) {
           ${rows.map(row => {
             const img = row.imageTag ? jfImageUrl(row.id, row.imageTag) : null;
             const onTap = row.track
-              ? () => playList(row.trackIds, row.trackIndex)
+              ? () => playList(row.trackIndex)
               : () => push(row.next);
             return html`
               <div key=${row.id} class="smc-browse-row" onClick=${onTap}>
@@ -866,11 +1046,38 @@ function SearchView({ hass, selectedSpeakers, onTabChange }) {
 
   const pushDrill = useCallback((frame) => setDrillStack(s => [...s, frame]), []);
 
-  // Tap a track: play it, then jump to Now Playing.
-  const playAndShow = useCallback((trackIds, startIndex) => {
-    playJfTracks(hassRef.current, eid, trackIds, startIndex);
+  // Tap a track: play it, then jump to Now Playing. `tracks` is queue-item metadata.
+  const playAndShow = useCallback((tracks, startIndex) => {
+    playJfTracks(hassRef.current, eid, tracks, startIndex);
     if (onTabChange) onTabChange('playing');
   }, [eid, onTabChange]);
+
+  // Drill track rows (album/playlist levels) → queue items.
+  const drillTrackMeta = useMemo(() =>
+    drillRows.filter(r => r.track).map(r => ({ id: r.id, name: r.name, subtitle: r.subtitle, imageTag: r.imageTag })),
+  [drillRows]);
+
+  // Play All / Add All at album & artist drill levels.
+  const drillCurrent = drillStack[drillStack.length - 1];
+  const canActAll = drillCurrent && (drillCurrent.kind === 'album' || drillCurrent.kind === 'artist');
+  const [addState, setAddState] = useState(null);
+  const collectTracks = useCallback(async () => {
+    if (!drillCurrent) return [];
+    if (drillCurrent.kind === 'album') return drillTrackMeta;
+    if (drillCurrent.kind === 'artist') return await jfArtistTracks(drillCurrent.artistId);
+    return [];
+  }, [drillCurrent, drillTrackMeta]);
+  const onPlayAll = useCallback(async () => {
+    const tracks = await collectTracks();
+    if (tracks.length) playJfTracks(hassRef.current, eid, tracks, 0);
+  }, [collectTracks, eid]);
+  const onAddAll = useCallback(async () => {
+    setAddState('adding');
+    const tracks = await collectTracks();
+    const n = await enqueueJfTracks(hassRef.current, eid, tracks);
+    setAddState(`Added ${n}`);
+    setTimeout(() => setAddState(null), 2000);
+  }, [collectTracks, eid]);
 
   const onInput = useCallback((e) => {
     setQ(e.target.value);
@@ -910,6 +1117,14 @@ function SearchView({ hass, selectedSpeakers, onTabChange }) {
               onClick=${() => setDrillStack(s => s.slice(0, i))}>${title}</span>
           `)}
         </div>
+        ${canActAll && !drillLoading && !drillError && html`
+          <div class="smc-action-bar">
+            <button class="smc-action-btn primary" onClick=${onPlayAll}>▶ Play All</button>
+            <button class="smc-action-btn" disabled=${addState === 'adding'} onClick=${onAddAll}>
+              ${addState === 'adding' ? 'Adding…' : (addState || '+ Add All')}
+            </button>
+          </div>
+        `}
         ${drillLoading && html`<p class="smc-loading">Loading…</p>`}
         ${drillError && html`<p class="smc-error">${drillError}</p>`}
         ${!drillLoading && !drillError && html`
@@ -918,7 +1133,7 @@ function SearchView({ hass, selectedSpeakers, onTabChange }) {
             ${drillRows.map(row => {
               const img = row.imageTag ? jfImageUrl(row.id, row.imageTag) : null;
               const onTap = row.track
-                ? () => playAndShow(row.trackIds, row.trackIndex)
+                ? () => playAndShow(drillTrackMeta, row.trackIndex)
                 : () => pushDrill(row.next);
               return html`
                 <div key=${row.id} class="smc-browse-row" onClick=${onTap}>
@@ -999,7 +1214,7 @@ function SearchView({ hass, selectedSpeakers, onTabChange }) {
           <div class="smc-browse-list">
             ${results.tracks.map(t => html`
               <div key=${t.Id} class="smc-browse-row"
-                onClick=${() => playAndShow([t.Id], 0)}>
+                onClick=${() => playAndShow([{ id: t.Id, name: t.Name, subtitle: (t.Artists && t.Artists.join(', ')) || t.AlbumArtist || '', imageTag: t.ImageTags?.Primary }], 0)}>
                 ${t.ImageTags?.Primary
                   ? html`<img class="smc-browse-thumb" src=${jfImageUrl(t.Id, t.ImageTags.Primary)} alt="" loading="eager" />`
                   : html`<div class="smc-browse-thumb-placeholder">♪</div>`}
@@ -1012,6 +1227,69 @@ function SearchView({ hass, selectedSpeakers, onTabChange }) {
           </div>
         `}
       `}
+    </div>
+  `;
+}
+
+// ── Queue View (card-side queue — Branch B) ─────────────────────
+function QueueView({ hass, selectedSpeakers, onTabChange }) {
+  const hassRef = useRef(hass);
+  hassRef.current = hass;
+  const eid = selectedSpeakers[0];
+  const [, force] = useState(0);
+
+  const np = useMemo(() => getNowPlaying(hass, selectedSpeakers), [hass, selectedSpeakers]);
+
+  // Queue is only valid for the speaker it was built for (clears on speaker change).
+  const queue = _smcQueueEntityId === eid ? _smcQueue : [];
+
+  const onJump = useCallback(async (track) => {
+    await jumpToQueueTrack(hassRef.current, eid, track);
+    force(n => n + 1);
+  }, [eid]);
+
+  if (!eid) {
+    return html`<div class="smc-content"><p class="smc-header">Queue</p><p class="smc-error">Select a speaker first</p></div>`;
+  }
+
+  if (!queue.length) {
+    return html`
+      <div class="np-empty">
+        <${IconMusicNote} />
+        <p class="np-empty-text">Nothing queued — browse and add music</p>
+        <button class="np-empty-btn" onClick=${(e) => { e.stopPropagation(); onTabChange('browse'); }}>Browse</button>
+      </div>
+    `;
+  }
+
+  // Highlight the playing track: prefer the Jellyfin art id we track, fall back
+  // to the now-playing title (covers natural queue advance, which we don't see).
+  const isCurrent = (q) =>
+    (_smcNowPlayingJfId && q.id === _smcNowPlayingJfId) ||
+    (!!np?.title && q.name === np.title);
+
+  return html`
+    <div class="smc-content">
+      <p class="smc-queue-count">${queue.length} track${queue.length !== 1 ? 's' : ''}</p>
+      <div class="smc-browse-list">
+        ${queue.map((q, i) => {
+          const img = q.imageTag ? jfImageUrl(q.id, q.imageTag) : null;
+          const cur = isCurrent(q);
+          return html`
+            <div key=${`${q.id}-${i}`} class=${`smc-browse-row${cur ? ' playing' : ''}`}
+              onClick=${() => onJump(q)}>
+              ${img
+                ? html`<img class="smc-browse-thumb" src=${img} alt="" loading="eager" />`
+                : html`<div class="smc-browse-thumb-placeholder">♪</div>`}
+              <div class="smc-browse-info">
+                <p class="smc-browse-title">${q.name}</p>
+                ${q.subtitle && html`<p class="smc-browse-subtitle">${q.subtitle}</p>`}
+              </div>
+              ${cur && html`<span class="smc-queue-now"><${IconPlay} size=${14} /></span>`}
+            </div>
+          `;
+        })}
+      </div>
     </div>
   `;
 }
@@ -1216,6 +1494,7 @@ function BottomNav({ activeTab, onTabChange }) {
     { id: 'speakers', label: 'Speakers', icon: IconSpeaker },
     { id: 'search', label: 'Search', icon: IconSearch },
     { id: 'browse', label: 'Browse', icon: IconBrowse },
+    { id: 'queue', label: 'Queue', icon: IconQueue },
     { id: 'playing', label: 'Now Playing', icon: IconNowPlaying },
   ];
   return html`
@@ -1378,6 +1657,9 @@ function SonosMusicApp({ hass, config }) {
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'browse' ? ' hidden' : ''}`}>
         <${BrowseView} hass=${hass} selectedSpeakers=${selectedSpeakers} />
+      </div>
+      <div class=${`smc-tab-panel${activeTab !== 'queue' ? ' hidden' : ''}`}>
+        <${QueueView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'playing' ? ' hidden' : ''}`}>
         <${NowPlayingView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />

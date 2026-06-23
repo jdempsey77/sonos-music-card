@@ -29,7 +29,7 @@ src/sonos-music-card.js   <- source of truth, always edit this
 
 dist/sonos-music-card.js  <- copy of src, committed for HACS
 
-scripts/deploy.sh         <- rsync src to HA + copy to dist/ + bump ?v= in HA Resources
+scripts/deploy.sh         <- scp src to HA + copy to dist/ + bump ?v= in HA Resources
 
 scripts/bump-version.py   <- WebSocket ?v= cache-buster bump (called by deploy.sh)
 
@@ -61,7 +61,7 @@ directly via the internal Jellyfin URL.
 ```
 cd ~/code/sonos-music-card
 export HOME=/home/jdempsey      # so deploy.sh finds the SSH key
-./scripts/deploy.sh             # rsync to HA + copy to dist/ + bump ?v= automatically
+./scripts/deploy.sh             # scp to HA + copy to dist/ + bump ?v= automatically
 ```
 After deploy: **Cmd+R** in HA browser (NOT Cmd+Shift+R — clears session cookie).
 
@@ -173,16 +173,41 @@ primary: '#3b82f6', accent: '#14b8a6', text: '#e5e5e5', muted: '#737373'
 ```
 No purple. Color is functional only (blue = selected, teal = group CTA, red = error).
 
+## Queue & speaker-entity facts (discovered 2026-06-22)
+The card's configured speakers (`family_room`, `office_2`, `garage_2`,
+`basement_2`, `float`) are **`music_assistant`-platform** `media_player` entities,
+not native `sonos` entities. (Native Sonos entities exist separately:
+`bedroom`, `garage`, `office`, `living_room`, `basement`.) The card still drives
+everything through generic HA `media_player.*` services, so this doesn't change
+control — but it dictates how the queue is read.
+
+**Queue = card-side (Branch B).** No HA service gives a reliable full-queue read
+for these entities:
+- `sonos.get_queue` → "did not match any entities" (rejects MA-platform entities).
+- `music_assistant.get_queue` → works, but returns only `current_item` +
+  `next_item` (not the full list), and images come back `null` (our Jellyfin
+  stream URLs are ingested as `media_type: radio`).
+
+So the card tracks what it enqueues itself in module state (`_smcQueue`,
+`_smcQueueEntityId`), populated by `playJfTracks()` / `enqueueJfTracks()`. The
+Queue tab renders that directly — no API call. Tap-to-jump uses `play_media`
+with no `enqueue` (replaces current track), leaving the visible list intact.
+Limitation: a natural queue advance on the speaker isn't observed, so the
+"currently playing" highlight falls back to matching the now-playing title.
+
 ## Current version
-**v0.14.0** — Search tab with Jellyfin full-text search, artist/album drill-down,
-breadcrumb nav. `playJfTracks()` extracted as shared module helper.
+**v0.15.0** — Queue tab (card-side queue, read-only + tap-to-jump), Play All /
+Add All at album & artist drill levels, and "Artist feat. X" collapse in Browse >
+Artists. `playJfTracks()` is now metadata-aware (takes queue items, not bare ids).
 Check top of `src/sonos-music-card.js` for the exact version comment.
 
 ## Open work
 - [x] Search tab (Jellyfin search API) — v0.14.0
+- [x] Now Playing queue view — v0.15.0 (Queue tab, card-side, read-only)
+- [x] Artist/album "Play all" affordance in Browse — v0.15.0 (Play All + Add All)
+- [ ] "Shuffle" affordance for Play All / Add All
+- [ ] Queue reorder / delete (Queue tab is read-only this version)
 - [ ] YouTube Music support (requires ytmusicapi Flask service on ska, nginx at ska.hq.stylee.org/ytm/)
-- [ ] Artist/album "Play all" / "Shuffle" affordances in Browse
-- [ ] Now Playing queue view
 - [ ] Art that tracks queue advance (currently shows first track's art only)
 - [ ] Direct-play (avoid mp3 transcode) for lossless on capable renderers
 
@@ -191,7 +216,7 @@ Check top of `src/sonos-music-card.js` for the exact version comment.
 2. `grep -m1 'v0\.' src/sonos-music-card.js` — confirm current version
 3. Check open work above
 4. Never edit the deployed file directly — always edit `src/`, then run `./scripts/deploy.sh`
-5. deploy.sh handles rsync + ?v= bump automatically. No manual WebSocket step needed.
+5. deploy.sh handles scp + ?v= bump automatically. No manual WebSocket step needed.
 6. Test in HA with **Cmd+R** after deploy
 
 ## CC session end checklist
