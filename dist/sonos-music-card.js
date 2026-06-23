@@ -1,4 +1,4 @@
-// Sonos Music Card v0.16.3
+// Sonos Music Card v0.16.4
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -107,7 +107,7 @@ function jfImageUrl(itemId, tag) {
 // speakers (on a different VLAN) can fetch it directly. mp3 transcode is the
 // most reliable container for Sonos over plain HTTP.
 function jfStreamUrl(itemId) {
-  return `${_jellyfinInternalUrl}/Audio/${itemId}/stream.mp3?api_key=${encodeURIComponent(_jellyfinToken)}&audioCodec=mp3`;
+  return `${_jellyfinInternalUrl}/Audio/${itemId}/stream.mp3?api_key=${encodeURIComponent(_jellyfinToken)}&audioCodec=mp3&Container=mp3`;
 }
 
 // Full-size cover art for the currently-playing Jellyfin track (public base —

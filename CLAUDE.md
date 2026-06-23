@@ -197,6 +197,11 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.16.4** — Fixed Sonos UPnP Error 714 "Illegal MIME-Type" on `play_media`.
+`jfStreamUrl` was missing `&Container=mp3`, so Jellyfin did not reliably set
+`Content-Type: audio/mpeg` and Sonos rejected the stream with a 714. Added
+`&Container=mp3` to the stream URL query string.
+
 **v0.16.3** — YTM track changes now re-render the UI immediately. `_ytmNowPlaying`
 is module-level state, so updating it didn't trigger a Preact render — the UI
 showed the previous track until some hass update happened to re-render. Added a
