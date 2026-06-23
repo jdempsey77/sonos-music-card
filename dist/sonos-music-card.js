@@ -1,4 +1,4 @@
-// Sonos Music Card v0.16.1
+// Sonos Music Card v0.16.2
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -41,8 +41,31 @@ let _ytmNowPlaying = null;  // {title, artist, thumbnail} | null
 // and music_assistant.get_queue returns only current_item + next_item with null
 // images — not the full list. So we track what WE enqueue ourselves. The Queue
 // tab reads these directly; no API call needed.
-let _smcQueue = [];           // [{id, name, subtitle, imageTag}] — tracks we enqueued
-let _smcQueueEntityId = null; // which speaker the queue belongs to (scopes validity)
+let _smcQueue = [];           // [{id, name, subtitle, imageTag}] — Jellyfin tracks we enqueued
+let _smcQueueEntityId = null; // which speaker the Jellyfin queue belongs to (scopes validity)
+
+// Parallel YTM queue — same idea, different shape (external thumbnails, videoIds).
+let _ytmQueue = [];           // [{videoId, title, artist, thumbnail}]
+let _ytmQueueEntityId = null; // which speaker the YTM queue belongs to
+
+// Normalize a YTM search/album row ({id|videoId, title, artist, thumbnail}) into
+// a queue item.
+function toYtmQueueItem(t) {
+  return {
+    videoId: t.videoId || t.id,
+    title: t.title || null,
+    artist: t.artist || null,
+    thumbnail: t.thumbnail || null,
+  };
+}
+
+// Which source is currently active (drives the Queue tab). YTM wins if it has a
+// queue or a stored now-playing track; otherwise Jellyfin if it does.
+function activeSource() {
+  if (_ytmQueue.length > 0 || _ytmNowPlaying) return 'ytm';
+  if (_smcQueue.length > 0 || _smcNowPlayingJfId) return 'jellyfin';
+  return null;
+}
 
 // GET against the Jellyfin API. Auth via api_key query param (not a custom
 // header) so the browser issues a simple CORS GET with no preflight.
@@ -194,7 +217,9 @@ function toQueueItem(t) {
 // queue (a fresh "play" replaces it — see Branch B note above).
 async function playJfTracks(hass, eid, tracks, startIndex = 0) {
   if (!hass || !eid || !tracks?.length) return;
-  _ytmNowPlaying = null;  // clear YTM metadata — Jellyfin is now the source
+  _ytmNowPlaying = null;        // clear YTM metadata — Jellyfin is now the source
+  _ytmQueue = [];
+  _ytmQueueEntityId = null;
   const slice = tracks.slice(startIndex);
   const ids = slice.map(t => t.id);
   try {
@@ -314,13 +339,18 @@ async function ytmStreamUrl(videoId) {
 // URL to the speaker via HA play_media. A different source from Jellyfin, so we
 // clear the Jellyfin now-playing art id and card-side queue. Returns true on
 // success. yt-dlp prefers m4a/AAC, which Sonos plays natively.
-async function playYtmTrack(hass, eid, videoId, meta = {}) {
+async function playYtmTrack(hass, eid, videoId, meta = {}, queue = null) {
   if (!hass || !eid || !videoId) return false;
   const url = await ytmStreamUrl(videoId);
   if (!url) { console.error('[smc] YTM stream resolve failed'); return false; }
   // HA reports the raw stream URL as media_title for YTM tracks, so stash the
   // real title/artist/art to substitute in Now Playing (see buildNpInfo).
-  _ytmNowPlaying = { title: meta.title || null, artist: meta.artist || null, thumbnail: meta.thumbnail || null };
+  _ytmNowPlaying = { videoId, title: meta.title || null, artist: meta.artist || null, thumbnail: meta.thumbnail || null };
+  // Populate the YTM queue: the full album list if given (Play All), else this
+  // one track (single tap). We don't pre-resolve the album — yt-dlp is ~1-3s per
+  // track — so the queue is metadata-only; tracks stream in via enqueue.
+  _ytmQueue = (queue && queue.length) ? queue.map(toYtmQueueItem) : [toYtmQueueItem({ videoId, ...meta })];
+  _ytmQueueEntityId = eid;
   _smcNowPlayingJfId = null;   // different source — drop Jellyfin art
   _smcQueue = [];              // different source — drop Jellyfin queue
   _smcQueueEntityId = null;
@@ -903,10 +933,13 @@ function getNowPlaying(hass, selectedSpeakers) {
     const state = hass.states[id];
     if (state && hasMediaContext(state)) return buildNpInfo(id, state);
   }
-  // Nothing playing/paused anywhere — player is idle, drop the stored art id
-  // and YTM metadata.
+  // Nothing playing/paused anywhere — player is idle, drop the stored Jellyfin
+  // art id (stale art after the queue ends is wrong). _ytmNowPlaying is NOT
+  // cleared here: we want the last-played YTM track to stay visible in Now
+  // Playing through idle/pause until a new source actively starts. It's cleared
+  // only in playJfTracks() (Jellyfin takes over); buildNpInfo's URL guard keeps
+  // it from leaking into a real Jellyfin title.
   _smcNowPlayingJfId = null;
-  _ytmNowPlaying = null;
   return null;
 }
 
@@ -1433,7 +1466,7 @@ function YTMView({ hass, selectedSpeakers, onTabChange }) {
     if (!ids.length) return;
     setAddState('starting');
     const first = albumTracks.find(t => t.id === ids[0]);
-    const ok = await playYtmTrack(hassRef.current, eid, ids[0], first || {});
+    const ok = await playYtmTrack(hassRef.current, eid, ids[0], first || {}, albumTracks);
     if (!ok) { setAddState(null); return; }
     if (onTabChange) onTabChange('playing');
     setAddState(null);
@@ -1589,16 +1622,40 @@ function QueueView({ hass, selectedSpeakers, onTabChange }) {
   hassRef.current = hass;
   const eid = selectedSpeakers[0];
   const [, force] = useState(0);
+  const [loadingId, setLoadingId] = useState(null);
 
   const np = useMemo(() => getNowPlaying(hass, selectedSpeakers), [hass, selectedSpeakers]);
 
-  // Queue is only valid for the speaker it was built for (clears on speaker change).
-  const queue = _smcQueueEntityId === eid ? _smcQueue : [];
+  // Render whichever source is active. Each queue is only valid for the speaker
+  // it was built for (clears on speaker change).
+  const source = activeSource();
+  const isYtm = source === 'ytm';
+  const queue = isYtm
+    ? (_ytmQueueEntityId === eid ? _ytmQueue : [])
+    : (_smcQueueEntityId === eid ? _smcQueue : []);
 
-  const onJump = useCallback(async (track) => {
+  // Jellyfin jump — replace the current track, leave the visible list intact.
+  const onJfJump = useCallback(async (track) => {
     await jumpToQueueTrack(hassRef.current, eid, track);
     force(n => n + 1);
   }, [eid]);
+
+  // YTM jump — resolve the stream (spinner on the row) and play it, preserving
+  // the YTM queue (unlike playYtmTrack, which rebuilds it).
+  const onYtmJump = useCallback(async (track) => {
+    if (!hassRef.current || !eid || loadingId) return;
+    setLoadingId(track.videoId);
+    const url = await ytmStreamUrl(track.videoId);
+    setLoadingId(null);
+    if (!url) return;
+    _ytmNowPlaying = { videoId: track.videoId, title: track.title, artist: track.artist, thumbnail: track.thumbnail };
+    try {
+      await hassRef.current.callService('media_player', 'play_media', {
+        entity_id: eid, media_content_id: url, media_content_type: 'music',
+      });
+    } catch (err) { console.error('[smc] YTM queue jump failed:', err); return; }
+    force(n => n + 1);
+  }, [eid, loadingId]);
 
   if (!eid) {
     return html`<div class="smc-content"><p class="smc-header">Queue</p><p class="smc-error">Select a speaker first</p></div>`;
@@ -1614,30 +1671,37 @@ function QueueView({ hass, selectedSpeakers, onTabChange }) {
     `;
   }
 
-  // Highlight the playing track: prefer the Jellyfin art id we track, fall back
-  // to the now-playing title (covers natural queue advance, which we don't see).
-  const isCurrent = (q) =>
-    (_smcNowPlayingJfId && q.id === _smcNowPlayingJfId) ||
-    (!!np?.title && q.name === np.title);
+  // Highlight the playing track. YTM: match the stored videoId. Jellyfin: prefer
+  // the tracked art id, fall back to the now-playing title (covers natural queue
+  // advance, which we don't observe).
+  const isCurrent = (q) => isYtm
+    ? (!!_ytmNowPlaying?.videoId && q.videoId === _ytmNowPlaying.videoId)
+    : ((_smcNowPlayingJfId && q.id === _smcNowPlayingJfId) || (!!np?.title && q.name === np.title));
 
   return html`
     <div class="smc-content">
       <p class="smc-queue-count">${queue.length} track${queue.length !== 1 ? 's' : ''}</p>
       <div class="smc-browse-list">
         ${queue.map((q, i) => {
-          const img = q.imageTag ? jfImageUrl(q.id, q.imageTag) : null;
           const cur = isCurrent(q);
+          const key = isYtm ? q.videoId : q.id;
+          const title = isYtm ? q.title : q.name;
+          const subtitle = isYtm ? q.artist : q.subtitle;
+          const img = isYtm ? q.thumbnail : (q.imageTag ? jfImageUrl(q.id, q.imageTag) : null);
+          const resolving = isYtm && loadingId === q.videoId;
           return html`
-            <div key=${`${q.id}-${i}`} class=${`smc-browse-row${cur ? ' playing' : ''}`}
-              onClick=${() => onJump(q)}>
+            <div key=${`${key}-${i}`} class=${`smc-browse-row${cur ? ' playing' : ''}`}
+              onClick=${() => (isYtm ? onYtmJump(q) : onJfJump(q))}>
               ${img
-                ? html`<img class="smc-browse-thumb" src=${img} alt="" loading="eager" />`
+                ? html`<img class="smc-browse-thumb" src=${img} alt="" loading="eager" referrerpolicy=${isYtm ? 'no-referrer' : undefined} />`
                 : html`<div class="smc-browse-thumb-placeholder">♪</div>`}
               <div class="smc-browse-info">
-                <p class="smc-browse-title">${q.name}</p>
-                ${q.subtitle && html`<p class="smc-browse-subtitle">${q.subtitle}</p>`}
+                <p class="smc-browse-title">${title}</p>
+                ${subtitle && html`<p class="smc-browse-subtitle">${subtitle}</p>`}
               </div>
-              ${cur && html`<span class="smc-queue-now"><${IconPlay} size=${14} /></span>`}
+              ${resolving
+                ? html`<div class="smc-row-spinner"></div>`
+                : cur && html`<span class="smc-queue-now"><${IconPlay} size=${14} /></span>`}
             </div>
           `;
         })}

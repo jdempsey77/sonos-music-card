@@ -197,6 +197,17 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.16.2** — Two YTM fixes. (1) YTM Now Playing no longer reverts to the raw URL
+on idle/pause: `getNowPlaying()` no longer clears `_ytmNowPlaying` (it's cleared
+only in `playJfTracks()` when Jellyfin takes over; `buildNpInfo`'s URL guard keeps
+it from leaking into a real title). (2) Queue tab now works for YTM. New parallel
+state `_ytmQueue` / `_ytmQueueEntityId` (shape `{videoId, title, artist, thumbnail}`),
+populated in `playYtmTrack()` — one entry for a tapped song, the full album for
+Play All (metadata-only; tracks still stream in via enqueue since yt-dlp is ~1-3s
+each). `_ytmNowPlaying` gained a `videoId` field for the playing-row highlight.
+New `activeSource()` helper (`'ytm' | 'jellyfin' | null`) picks which queue the
+QueueView renders; YTM tap-to-jump resolves the stream (per-row spinner) and plays
+without rebuilding the queue. `toYtmQueueItem()` normalizes id→videoId.
 **v0.16.1** — YTM Now Playing fix. HA reports the raw `videoplayback?expire=…`
 stream URL as `media_title` for YTM tracks, so Now Playing showed a URL and a
 placeholder. New module var `_ytmNowPlaying` ({title, artist, thumbnail}) is set
@@ -249,7 +260,7 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [ ] Art that tracks queue advance (currently shows first track's art only)
 - [ ] Direct-play (avoid mp3 transcode) for lossless on capable renderers
 - [x] YTM Now Playing title/artist/art — v0.16.1 (`_ytmNowPlaying` + buildNpInfo substitution)
-- [ ] YTM card-side queue (YTM playback clears `_smcQueue`; Queue tab empty for YTM)
+- [x] YTM card-side queue — v0.16.2 (`_ytmQueue` + `activeSource()`; Queue tab dual-source)
 
 ## Session startup checklist
 1. Read this file (`cat ~/code/sonos-music-card/CLAUDE.md`)
