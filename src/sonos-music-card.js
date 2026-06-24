@@ -1,4 +1,4 @@
-// Sonos Music Card v0.17.0
+// Sonos Music Card v0.17.1
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -11,6 +11,11 @@
 // Search/Browse show. Every track row has a play button (starts immediately) and
 // a + button (enqueues without interrupting); + shows a brief "Added to queue"
 // toast. No playback/transport/queue logic changed — UI layer only.
+// v0.17.1: _smcService is the single source of truth for all four tabs (Queue,
+// Now Playing, MiniPlayer read it directly, not a playback heuristic); enqueue
+// paths cross-clear the opposing service; speaker chips ARE the group (tap to
+// add re-joins, tap to remove unjoins — no separate "Play here" CTA);
+// ServiceBar hidden on Queue / Now Playing; unified Add-All toast feedback.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -67,14 +72,6 @@ function toYtmQueueItem(t) {
     artist: t.artist || null,
     thumbnail: t.thumbnail || null,
   };
-}
-
-// Which source is currently active (drives the Queue tab). YTM wins if it has a
-// queue or a stored now-playing track; otherwise Jellyfin if it does.
-function activeSource() {
-  if (_ytmQueue.length > 0 || _ytmNowPlaying) return 'ytm';
-  if (_smcQueue.length > 0 || _smcNowPlayingJfId) return 'jellyfin';
-  return null;
 }
 
 // GET against the Jellyfin API. Auth via api_key query param (not a custom
@@ -262,6 +259,11 @@ async function playJfTracks(hass, eid, tracks, startIndex = 0) {
 // Mirrors the appended tracks into the card-side queue. Returns the count added.
 async function enqueueJfTracks(hass, eid, tracks) {
   if (!hass || !eid || !tracks?.length) return 0;
+  // Cross-clear the opposing service's state — enqueueing into Jellyfin makes
+  // Jellyfin the active source (mirrors what playJfTracks does on the play path).
+  if (_smcService === 'jf') {
+    _ytmNowPlaying = null; _ytmDirty = true; _ytmQueue = []; _ytmQueueEntityId = null;
+  }
   // If the card-side queue is for a different speaker, this enqueue starts a
   // fresh card-side queue scoped to eid.
   if (_smcQueueEntityId !== eid) { _smcQueue = []; _smcQueueEntityId = eid; }
@@ -386,6 +388,11 @@ async function enqueueYtmTrack(hass, eid, track) {
   if (!hass || !eid || !_ytmServiceUrl) return false;
   const videoId = track.videoId || track.id;
   if (!videoId) return false;
+  // Cross-clear the opposing service's state — enqueueing into YTM makes YTM the
+  // active source (mirrors what playYtmTrack does on the play path).
+  if (_smcService === 'ytm') {
+    _smcNowPlayingJfId = null; _smcQueue = []; _smcQueueEntityId = null;
+  }
   // Scope the card-side queue to this speaker (mirrors enqueueJfTracks).
   if (_ytmQueueEntityId !== eid) { _ytmQueue = []; _ytmQueueEntityId = eid; }
   const url = `${_ytmServiceUrl}/audio/${encodeURIComponent(videoId)}.m4a`;
@@ -515,7 +522,7 @@ const cardStyles = `
     flex: 1;
     overflow-y: auto;
     padding: 20px 16px;
-    padding-bottom: 60px;
+    padding-bottom: 12px;
     min-height: 0;
   }
   .smc-header {
@@ -523,83 +530,12 @@ const cardStyles = `
     text-transform: uppercase; letter-spacing: 1px; margin: 0 0 16px 4px;
   }
 
-  /* ── Speaker checkbox list ── */
-  .smc-spk-header {
-    display: flex; align-items: center;
-    justify-content: space-between;
-    padding: 8px 14px 4px;
-  }
-  .smc-spk-title {
-    font-size: 10px; color: ${THEME.muted};
-    text-transform: uppercase; letter-spacing: 0.1em;
-  }
-  .smc-spk-quick {
-    display: flex; gap: 6px; font-size: 10px; cursor: pointer;
-  }
-  .smc-spk-quick span:first-child { color: ${THEME.primary}; }
-  .smc-spk-group-label {
-    padding: 6px 14px 2px;
-    font-size: 9px; color: #404040;
-    text-transform: uppercase; letter-spacing: 0.12em;
-  }
-  .smc-spk-row {
-    display: flex; align-items: center; gap: 10px;
-    padding: 9px 14px; cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
-  }
-  .smc-spk-row:hover { background: #161616; }
-  .smc-spk-row.selected { background: #0f1f3d; }
-  .smc-chk {
-    width: 18px; height: 18px; border-radius: 4px;
-    border: 1.5px solid ${THEME.border};
-    background: ${THEME.surface};
-    flex-shrink: 0;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 10px; font-weight: 700;
-  }
-  .smc-chk.checked {
-    background: ${THEME.primary};
-    border-color: ${THEME.primary};
-    color: white;
-  }
-  .smc-spk-icon {
-    width: 32px; height: 32px; border-radius: 6px;
-    background: ${THEME.surface}; border: 1px solid ${THEME.border};
-    flex-shrink: 0; display: flex; align-items: center;
-    justify-content: center; font-size: 11px; color: #404040;
-  }
-  .smc-spk-info { flex: 1; min-width: 0; }
-  .smc-spk-name {
-    font-size: 13px; color: ${THEME.text};
-    margin: 0; white-space: nowrap;
-    overflow: hidden; text-overflow: ellipsis;
-  }
-  .smc-spk-name.muted { color: ${THEME.muted}; }
-  .smc-spk-sub { font-size: 10px; color: ${THEME.muted}; margin: 2px 0 0; }
-  .smc-spk-sub.playing { color: ${THEME.primary}; }
-  .smc-spk-sub.off { color: #404040; }
-  .smc-spk-vol { font-size: 10px; color: ${THEME.muted}; flex-shrink: 0; }
-  .smc-spk-divider { height: 1px; background: #1a1a1a; margin: 4px 14px; }
-
-  /* ── Group bar ── */
-  .smc-group-bar {
-    position: absolute; bottom: 0; left: 0; right: 0;
-    background: ${THEME.accent}; color: ${THEME.accentDark};
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 10px 16px; font-size: 13px; font-weight: 600;
-    z-index: 2; cursor: pointer;
-  }
-  .smc-group-bar:active { opacity: 0.85; }
-  .smc-group-names { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; font-weight: 400; margin-right: 12px; }
-  .smc-group-action { font-weight: 700; white-space: nowrap; font-size: 13px; }
-  .smc-group-warn { font-size: 9px; opacity: 0.7; font-weight: 400; margin-top: 2px; }
-
   /* ── Top nav tabs ── */
   .smc-nav {
     background: ${THEME.base};
     display: flex; gap: 6px; padding: 12px 16px 8px;
     flex-shrink: 0; z-index: 3;
-    flex-wrap: wrap;   /* 6 tabs: wrap to a second row on narrow cards */
+    flex-wrap: wrap;   /* 4 tabs */
   }
   .smc-nav-item {
     display: flex; align-items: center; gap: 5px;
@@ -677,7 +613,7 @@ const cardStyles = `
   .np-scroll {
     flex: 1; overflow-y: auto; min-height: 0;
     display: flex; flex-direction: column; align-items: center;
-    padding: 16px; padding-bottom: 60px;
+    padding: 16px; padding-bottom: 12px;
   }
   .np-art-square {
     width: 160px; height: 160px; border-radius: 12px;
@@ -894,18 +830,6 @@ const cardStyles = `
   .smc-spk-chip { background: #1c1c1c; border: 1px solid #2e2e2e; color: #666; }
   .smc-spk-chip.selected { background: #0f1f3d; border-color: #3b82f6; color: #93c5fd; }
   .smc-chip-dot { width: 6px; height: 6px; border-radius: 50%; background: ${THEME.primary}; flex-shrink: 0; }
-  .smc-inline-group {
-    display: flex; align-items: center; justify-content: space-between; gap: 12px;
-    margin-top: 8px; background: ${THEME.accent}; color: ${THEME.accentDark};
-    border-radius: 8px; padding: 7px 12px; cursor: pointer;
-    -webkit-tap-highlight-color: transparent;
-  }
-  .smc-inline-group:active { opacity: 0.85; }
-  .smc-inline-group-names {
-    flex: 1; min-width: 0; font-size: 12px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  .smc-inline-group-action { font-size: 13px; font-weight: 700; white-space: nowrap; }
 
   /* ── Service bar (Jellyfin / YouTube Music toggle) ── */
   .smc-service-bar {
@@ -954,7 +878,10 @@ function smcResolveImage(url) {
   return url.startsWith('http') ? url : `${location.origin}${url}`;
 }
 
-function buildNpInfo(id, state) {
+// Build now-playing info for a speaker, scoped to the active service. The service
+// (not a playback heuristic) decides where title/artist/art come from so the two
+// services never cross-read each other's metadata.
+function buildNpInfo(id, state, service = _smcService) {
   const a = state.attributes;
   const duration = (a.media_duration > 0 && a.media_duration < 86400)
     ? a.media_duration : 0;
@@ -965,7 +892,7 @@ function buildNpInfo(id, state) {
     title: a.media_title || 'Unknown',
     artist: a.media_artist || '',
     album: a.media_album_name || '',
-    art: smcResolveImage(a.entity_picture) || jfNowPlayingArt(),
+    art: smcResolveImage(a.entity_picture),
     isPlaying: state.state === 'playing',
     isExternal: isExternalSource(state),
     source: a.source || null,
@@ -976,12 +903,16 @@ function buildNpInfo(id, state) {
     repeat: a.repeat || 'off',
   };
 
-  // HA reports the raw stream URL as media_title for YTM tracks. Substitute the
-  // stored metadata when we have it and the title looks like a URL (not a name).
-  if (_ytmNowPlaying && (!a.media_title || info.title.includes('videoplayback') || info.title.startsWith('http'))) {
-    info.title = _ytmNowPlaying.title || info.title;
-    info.artist = _ytmNowPlaying.artist || info.artist;
-    info.art = info.art || _ytmNowPlaying.thumbnail || null;
+  if (service === 'ytm') {
+    // YTM active: title/artist/art come from stored YTM metadata (HA reports the
+    // raw stream URL as media_title). Never read Jellyfin art.
+    info.title = _ytmNowPlaying?.title || info.title;
+    info.artist = _ytmNowPlaying?.artist || info.artist;
+    info.art = info.art || _ytmNowPlaying?.thumbnail || null;
+  } else {
+    // Jellyfin active: source cover art from Jellyfin when HA gives us none.
+    // Never read YTM metadata.
+    info.art = info.art || jfNowPlayingArt();
   }
 
   return info;
@@ -1028,24 +959,40 @@ function getSpeakers(hass, config = _smcConfig) {
   return ids;
 }
 
-function getNowPlaying(hass, selectedSpeakers) {
+// Now-playing is scoped to the active service (_smcService), not a playback
+// heuristic. In YTM context it's driven by the stored YTM metadata; in Jellyfin
+// context by the live HA media_player state. The two never cross-read, so
+// switching the service re-scopes Now Playing immediately even while the other
+// service is audibly playing (the card moves context — audio keeps going).
+function getNowPlaying(hass, selectedSpeakers, service = _smcService) {
   if (!hass) return null;
-  // Selected speakers first
+
+  if (service === 'ytm') {
+    // No YTM track has played → nothing to show in YTM context.
+    if (!_ytmNowPlaying) return null;
+    // Use a speaker with media context for transport/progress; fall back to the
+    // first selected speaker so controls still target something.
+    const id = selectedSpeakers.find(i => hass.states[i] && hasMediaContext(hass.states[i]))
+      || getSpeakers(hass).find(i => hass.states[i] && hasMediaContext(hass.states[i]))
+      || selectedSpeakers[0];
+    const state = id ? hass.states[id] : null;
+    if (!state) return null;
+    return buildNpInfo(id, state, 'ytm');
+  }
+
+  // Jellyfin context — selected speakers first, then any configured speaker.
   for (const id of selectedSpeakers) {
     const state = hass.states[id];
-    if (state && hasMediaContext(state)) return buildNpInfo(id, state);
+    if (state && hasMediaContext(state)) return buildNpInfo(id, state, 'jf');
   }
-  // Fallback: any configured speaker with media context
   for (const id of getSpeakers(hass)) {
     const state = hass.states[id];
-    if (state && hasMediaContext(state)) return buildNpInfo(id, state);
+    if (state && hasMediaContext(state)) return buildNpInfo(id, state, 'jf');
   }
   // Nothing playing/paused anywhere — player is idle, drop the stored Jellyfin
   // art id (stale art after the queue ends is wrong). _ytmNowPlaying is NOT
-  // cleared here: we want the last-played YTM track to stay visible in Now
-  // Playing through idle/pause until a new source actively starts. It's cleared
-  // only in playJfTracks() (Jellyfin takes over); buildNpInfo's URL guard keeps
-  // it from leaking into a real Jellyfin title.
+  // cleared here so the last-played YTM track stays visible if the user switches
+  // back to the YTM service; it's cleared only in playJfTracks()/enqueueJfTracks().
   _smcNowPlayingJfId = null;
   return null;
 }
@@ -1076,14 +1023,12 @@ function TrackButtons({ onPlay, onQueue, loading }) {
 }
 
 // ── Speaker Bar (always-visible, top of card) ───────────────────
-// Replaces the old Speakers tab. Speakers render as pill chips; tapping toggles
-// selection via the existing smcSelectSpeaker handler. When 2+ are selected an
-// inline "Play here ▶" group bar appears (same join logic as handleGroup).
-function SpeakerBar({ hass, selected, onSelect, onGroup, isPlaying }) {
+// The chips ARE the group (Model A). Tapping an unselected chip adds it and
+// re-joins the whole selection (primary as coordinator, playback resumed);
+// tapping a selected chip removes it and unjoins that speaker. There is no
+// separate "Play here" CTA — selection and grouping are the same action.
+function SpeakerBar({ hass, selected, onSelect }) {
   const speakers = useMemo(() => getSpeakers(hass).slice().sort(), [hass]);
-  const selectedNames = useMemo(() =>
-    selected.map(id => hass?.states[id]?.attributes?.friendly_name || id.replace('media_player.', '')),
-  [selected, hass]);
 
   return html`
     <div class="smc-speaker-bar">
@@ -1106,12 +1051,6 @@ function SpeakerBar({ hass, selected, onSelect, onGroup, isPlaying }) {
             })}
           </div>
         `}
-      ${selected.length >= 2 && html`
-        <div class="smc-inline-group" onClick=${onGroup}>
-          <span class="smc-inline-group-names">${selectedNames.join(' + ')}</span>
-          <span class="smc-inline-group-action">Play here ▶</span>
-        </div>
-      `}
     </div>
   `;
 }
@@ -1186,9 +1125,9 @@ function BrowseView({ hass, selectedSpeakers, onTabChange, onToast }) {
     setAddState('adding');
     const tracks = await collectTracks();
     const n = await enqueueJfTracks(hassRef.current, eid, tracks);
-    setAddState(`Added ${n}`);
-    setTimeout(() => setAddState(null), 2000);
-  }, [collectTracks, eid]);
+    setAddState(null);
+    onToast && onToast(`Added ${n} tracks`);
+  }, [collectTracks, eid, onToast]);
 
   if (!eid) {
     return html`<div class="smc-content"><p class="smc-header">Browse</p><p class="smc-error">Select a speaker first</p></div>`;
@@ -1339,9 +1278,9 @@ function SearchView({ hass, selectedSpeakers, onTabChange, onToast }) {
     setAddState('adding');
     const tracks = await collectTracks();
     const n = await enqueueJfTracks(hassRef.current, eid, tracks);
-    setAddState(`Added ${n}`);
-    setTimeout(() => setAddState(null), 2000);
-  }, [collectTracks, eid]);
+    setAddState(null);
+    onToast && onToast(`Added ${n} tracks`);
+  }, [collectTracks, eid, onToast]);
 
   const onInput = useCallback((e) => {
     setQ(e.target.value);
@@ -1385,7 +1324,7 @@ function SearchView({ hass, selectedSpeakers, onTabChange, onToast }) {
           <div class="smc-action-bar">
             <button class="smc-action-btn primary" onClick=${onPlayAll}>▶ Play All</button>
             <button class="smc-action-btn" disabled=${addState === 'adding'} onClick=${onAddAll}>
-              ${addState === 'adding' ? 'Adding…' : (addState || '+ Add All')}
+              ${addState === 'adding' ? 'Adding…' : '+ Add All'}
             </button>
           </div>
         `}
@@ -1737,19 +1676,18 @@ function YTMView({ hass, selectedSpeakers, onTabChange, onToast }) {
 }
 
 // ── Queue View (card-side queue — Branch B) ─────────────────────
-function QueueView({ hass, selectedSpeakers, onTabChange }) {
+function QueueView({ hass, selectedSpeakers, onTabChange, service }) {
   const hassRef = useRef(hass);
   hassRef.current = hass;
   const eid = selectedSpeakers[0];
   const [, force] = useState(0);
   const [loadingId, setLoadingId] = useState(null);
 
-  const np = useMemo(() => getNowPlaying(hass, selectedSpeakers), [hass, selectedSpeakers]);
+  const np = useMemo(() => getNowPlaying(hass, selectedSpeakers, service), [hass, selectedSpeakers, service]);
 
-  // Render whichever source is active. Each queue is only valid for the speaker
-  // it was built for (clears on speaker change).
-  const source = activeSource();
-  const isYtm = source === 'ytm';
+  // The active service (not a playback heuristic) decides which queue to show.
+  // Each queue is only valid for the speaker it was built for (clears on change).
+  const isYtm = service === 'ytm';
   const queue = isYtm
     ? (_ytmQueueEntityId === eid ? _ytmQueue : [])
     : (_smcQueueEntityId === eid ? _smcQueue : []);
@@ -1831,11 +1769,11 @@ function QueueView({ hass, selectedSpeakers, onTabChange }) {
 }
 
 // ── Now Playing View ────────────────────────────────────────────
-function NowPlayingView({ hass, selectedSpeakers, onTabChange }) {
+function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
   const hassRef = useRef(hass);
   hassRef.current = hass;
 
-  const np = useMemo(() => getNowPlaying(hass, selectedSpeakers), [hass, selectedSpeakers]);
+  const np = useMemo(() => getNowPlaying(hass, selectedSpeakers, service), [hass, selectedSpeakers, service]);
 
   // Use the entity that is actually playing (from np.entityId) rather than
   // selectedSpeakers[0], which may be null if _smcSpeakers wasn't yet synced.
@@ -2114,19 +2052,42 @@ function smcAutoDetect(hass) {
   }
 }
 
-function smcSelectSpeaker(entityId, hass) {
-  const idx = _smcSpeakers.indexOf(entityId);
-  if (idx >= 0) {
-    // Removing — unjoin if currently grouped
+// Chip toggle — the chips ARE the group (Model A). Tap an unselected chip to add
+// it: it joins the whole selection under the primary (first selected) coordinator
+// and resumes playback if anything was playing. Tap a selected chip to remove it:
+// it unjoins (and so stops). _smcSpeakers updates synchronously (before any await)
+// so the UI can re-render optimistically; HA state reconciles afterward.
+async function smcToggleSpeaker(entityId, hass) {
+  const isSelected = _smcSpeakers.includes(entityId);
+
+  if (isSelected) {
+    // Remove: unjoin this speaker (stops it), remove from selection.
     _smcSpeakers = _smcSpeakers.filter(id => id !== entityId);
-    const state = hass?.states[entityId];
-    const isGrouped = (state?.attributes?.group_members?.length || 0) > 1;
-    if (isGrouped && hass) {
-      hass.callService('media_player', 'unjoin', {}, { entity_id: entityId });
-    }
+    if (hass) await hass.callService('media_player', 'unjoin', { entity_id: entityId });
   } else {
+    // Add: add to selection, then rejoin the whole group with primary as coordinator.
     _smcSpeakers = [..._smcSpeakers, entityId];
+    if (hass && _smcSpeakers.length >= 2) {
+      const primary = _smcSpeakers[0];
+      // Unjoin all first, then rejoin — reuse the 500ms/1000ms timing from the
+      // old handleGroup.
+      await Promise.all(_smcSpeakers.map(id =>
+        hass.callService('media_player', 'unjoin', { entity_id: id })
+      ));
+      await new Promise(r => setTimeout(r, 500));
+      await hass.callService('media_player', 'join', {
+        entity_id: primary,
+        group_members: _smcSpeakers,
+      });
+      // Resume playback on the coordinator if something was playing.
+      const wasPlaying = _smcSpeakers.some(id => hass.states[id]?.state === 'playing');
+      if (wasPlaying) {
+        await new Promise(r => setTimeout(r, 1000));
+        await hass.callService('media_player', 'media_play', { entity_id: primary });
+      }
+    }
   }
+
   _smcUserSelected = true;
   _smcUserSelectedAt = Date.now();
   _smcDirty = true;
@@ -2157,34 +2118,16 @@ function SonosMusicApp({ hass, config }) {
   // Read directly from module-level state — always current
   const selectedSpeakers = _smcSpeakers;
 
-  // Derive now-playing directly from hass — no cached state
-  const nowPlaying = useMemo(() => getNowPlaying(hass, selectedSpeakers), [hass, selectedSpeakers]);
+  // Derive now-playing directly from hass, scoped to the active service.
+  const nowPlaying = useMemo(() => getNowPlaying(hass, selectedSpeakers, service), [hass, selectedSpeakers, service]);
 
-  const isPlaying = useMemo(() =>
-    selectedSpeakers.some(id => hass?.states[id]?.state === 'playing'),
-  [hass, selectedSpeakers]);
-
+  // Chip tap → toggle membership (the chips ARE the group). _smcSpeakers mutates
+  // synchronously inside smcToggleSpeaker, so the optimistic forceUpdate reflects
+  // the change immediately; the async join/unjoin reconciles against HA after.
   const handleSelectSpeaker = useCallback((entityId) => {
-    smcSelectSpeaker(entityId, hass);
+    smcToggleSpeaker(entityId, hass);
     forceUpdate(n => n + 1);
   }, [hass]);
-
-  const handleGroup = useCallback(async () => {
-    if (!hass || selectedSpeakers.length < 2) return;
-    const primary = selectedSpeakers[0];
-    const wasPlaying = selectedSpeakers.some(id => hass.states[id]?.state === 'playing');
-    try {
-      await Promise.all(
-        selectedSpeakers.map(id => hass.callService('media_player', 'unjoin', { entity_id: id }))
-      );
-      await new Promise(r => setTimeout(r, 500));
-      await hass.callService('media_player', 'join', { entity_id: primary, group_members: selectedSpeakers });
-      if (wasPlaying) {
-        await new Promise(r => setTimeout(r, 1000));
-        await hass.callService('media_player', 'media_play', { entity_id: primary });
-      }
-    } catch (err) { console.error('[smc] Group failed:', err); }
-  }, [hass, selectedSpeakers]);
 
   // Service toggle — mirror into module state so the views read it consistently,
   // and into React state so the panels re-render/re-fetch.
@@ -2211,8 +2154,10 @@ function SonosMusicApp({ hass, config }) {
   return html`
     <div class="smc-card">
       <${SpeakerBar} hass=${hass} selected=${selectedSpeakers}
-        onSelect=${handleSelectSpeaker} onGroup=${handleGroup} isPlaying=${isPlaying} />
-      <${ServiceBar} service=${service} onService=${setService} />
+        onSelect=${handleSelectSpeaker} />
+      ${(activeTab === 'search' || activeTab === 'browse') && html`
+        <${ServiceBar} service=${service} onService=${setService} />
+      `}
       <${BottomNav} activeTab=${activeTab} onTabChange=${setActiveTab} />
 
       <div class=${`smc-tab-panel${jfSearchVisible ? '' : ' hidden'}`}>
@@ -2228,10 +2173,10 @@ function SonosMusicApp({ hass, config }) {
           onTabChange=${setActiveTab} onToast=${showToast} />
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'queue' ? ' hidden' : ''}`}>
-        <${QueueView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
+        <${QueueView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} service=${service} />
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'playing' ? ' hidden' : ''}`}>
-        <${NowPlayingView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
+        <${NowPlayingView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} service=${service} />
       </div>
 
       ${activeTab !== 'playing' && html`
