@@ -235,6 +235,24 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.17.2** — Four targeted fixes. (1) **Jellyfin now-playing art 404**:
+`buildNpInfo` now sets `art: jfNowPlayingArt() || smcResolveImage(a.entity_picture)`
+— the HA `entity_picture` proxy returns a non-null URL that 404s for native Sonos
+entities (Music Assistant was uninstalled), so the old jfNowPlayingArt() *fallback*
+never fired; it's now first, and the redundant `info.art = info.art || jfNowPlayingArt()`
+in the Jellyfin branch was removed. (2) **YTM album drill Add All**: the album drill
+action bar gained a `+ Add All` button beside `▶ Play All`, backed by a new
+`addAlbumAll` handler (enqueues every track via `enqueue:'add'`, tracks them in
+`_ytmQueue`, toasts `Added N tracks`). (3) **YTM next/prev**: `handleNext`/`handlePrev`
+in NowPlayingView now branch on `_smcService === 'ytm'` — HA `media_next_track` /
+`media_previous_track` do nothing for the non-native YTM queue, so the card resolves
+the adjacent `_ytmQueue` track itself and `play_media`s it (sets `_ytmNowPlaying` +
+`_ytmDirty`). Native/Jellyfin path unchanged. (4) **localStorage tracking-prevention
+spam**: all `localStorage` access routed through `storageAvailable()` / `storageSave()`
+/ `storageLoad()` helpers that probe once and fall back to in-memory when storage is
+blocked (Edge/Chromium tracking prevention in some HA contexts), silencing ~248 console
+warnings.
+
 **v0.17.1** — Architecture fixes on top of the v0.17.0 redesign. (1) `_smcService`
 is now the **single source of truth for all four tabs**: QueueView, NowPlayingView,
 and MiniPlayer read it directly (via service-scoped `getNowPlaying`/`buildNpInfo`),
@@ -353,6 +371,10 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [ ] Direct-play (avoid mp3 transcode) for lossless on capable renderers
 - [x] YTM Now Playing title/artist/art — v0.16.1 (`_ytmNowPlaying` + buildNpInfo substitution)
 - [x] YTM card-side queue — v0.16.2 (`_ytmQueue` + `activeSource()`; Queue tab dual-source)
+- [x] YTM album drill Add All button — v0.17.2 (`addAlbumAll`)
+- [x] YTM next/prev (card-side, HA next/prev no-op for non-native queue) — v0.17.2
+- [x] Jellyfin now-playing art 404 (prefer `jfNowPlayingArt()` over HA proxy) — v0.17.2
+- [x] localStorage tracking-prevention console spam — v0.17.2 (safe storage wrapper)
 
 ## Session startup checklist
 1. Read this file (`cat ~/code/sonos-music-card/CLAUDE.md`)
