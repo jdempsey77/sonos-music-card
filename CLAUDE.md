@@ -13,7 +13,15 @@
 ## Project overview
 Custom Home Assistant Lovelace card for Sonos speakers.
 Speaker selection, multi-room grouping, Now Playing with full transport controls,
-and a media browser backed by Jellyfin.
+and a media browser backed by Jellyfin **and** YouTube Music.
+
+**Layout (v0.17.0+, top → bottom):** always-visible `SpeakerBar` (speaker chips +
+inline "Play here ▶" group bar) → `ServiceBar` (Jellyfin / YouTube Music toggle)
+→ `BottomNav` (4 tabs: Search · Browse · Queue · Now Playing) → tab content →
+`MiniPlayer`. The active service (`_smcService`) decides whether Search/Browse
+render Jellyfin or YTM content. Every track row carries a blue **play** button
+(starts immediately) and a gray **+** button (enqueues without interrupting; shows
+a brief "Added to queue" toast via `TrackButtons`).
 
 - **Control / transport**: native HA `media_player.*` services (HA reaches the speakers).
 - **Media browsing**: Jellyfin REST API, called directly from the card (browser).
@@ -86,9 +94,31 @@ function getSpeakers(hass, config = _smcConfig) {
 }
 ```
 
+### Layout components (v0.17.0)
+- **`SpeakerBar`** — replaces the old `SpeakersView`/Speakers tab. Renders the
+  configured speakers as pill chips (selected = blue, unselected = gray); tap
+  toggles via the unchanged `smcSelectSpeaker`. A playing speaker shows a dot.
+  When 2+ are selected it shows an inline "Play here ▶" group bar (same join
+  logic as `handleGroup`). Always visible at the top of the card.
+- **`ServiceBar`** — Jellyfin / YouTube Music toggle, drives `_smcService`.
+  Active Jellyfin = teal accent, active YTM = red accent.
+- **`BottomNav`** — 4 tabs only: Search, Browse, Queue, Now Playing.
+- **`TrackButtons`** — the play + `+` button pair on every track row. Play calls
+  the existing play path and jumps to Now Playing; `+` calls the existing enqueue
+  path (`enqueueJfTracks` / `enqueueYtmTrack`) and fires the "Added to queue"
+  toast. Non-track rows (artists/albums/playlists) keep tap-to-navigate + chevron.
+- **Service routing** lives in `SonosMusicApp`: Jellyfin keeps separate Search and
+  Browse panels; YTM uses a single `YTMView` panel shown under either tab. All
+  panels stay mounted (hidden via CSS) so per-view state persists across tabs.
+
+The old `SpeakersView`/`SpeakerRow` are removed (their `.smc-spk-row`/`.smc-group-bar`
+CSS is now dead but left in place). **No playback, transport, queue, Jellyfin, or
+YTM service logic changed in v0.17.0 — UI/interaction layer only.**
+
 ### Module-level state (survives Preact re-renders)
 ```js
 let _smcSpeakers = []        // selected speakers — single source of truth
+let _smcService = 'jf'       // active service: 'jf' (Jellyfin) | 'ytm' — drives Search/Browse
 let _smcUserSelected = false // true after explicit user tap — blocks auto-detect
 let _smcUserSelectedAt = 0   // timestamp of last user tap
 let _smcDirty = false        // signals Preact to re-render after auto-detect change
@@ -197,6 +227,19 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.17.0** — Major layout redesign (UI/interaction layer only — no playback,
+transport, queue, Jellyfin, or YTM service logic touched). The bottom-nav
+Speakers tab is replaced by an always-visible `SpeakerBar` at the top (speaker
+chips + inline "Play here ▶" group bar); the YTM tab is replaced by a `ServiceBar`
+(Jellyfin / YouTube Music toggle driving the new `_smcService` state). Nav is now
+4 tabs: Search · Browse · Queue · Now Playing. The active service decides whether
+Search/Browse show Jellyfin or YTM content (Jellyfin = two panels, YTM = one
+`YTMView` shown under either tab). Every track row gained a `TrackButtons` pair:
+a blue play button (plays immediately, jumps to Now Playing) and a gray `+`
+button (enqueues via the existing `enqueueJfTracks`/new `enqueueYtmTrack`, no
+playback interruption) that fires a brief teal "Added to queue" toast. Non-track
+rows keep tap-to-navigate + chevron. `SpeakersView`/`SpeakerRow` removed.
+
 **v0.16.5** — Fixed Sonos UPnP Error 714 "Illegal MIME-Type" on the
 **YouTube Music** path. The card handed Sonos the raw, extensionless
 googlevideo URL; HA's Sonos integration infers the UPnP `protocolInfo` MIME

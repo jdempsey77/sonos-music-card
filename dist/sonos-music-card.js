@@ -1,10 +1,16 @@
-// Sonos Music Card v0.16.5
+// Sonos Music Card v0.17.0
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
 // Jellyfin stream URL the speakers fetch directly. No Music Assistant.
-// v0.16.0 adds a YouTube Music tab backed by ytm-service on ska (ytmusicapi
-// search + yt-dlp stream resolution); speakers fetch the googlevideo m4a URL.
+// v0.16.0 adds YouTube Music backed by ytm-service on ska (ytmusicapi search +
+// yt-dlp stream resolution); speakers fetch the googlevideo m4a URL.
+// v0.17.0 layout redesign: always-visible SpeakerBar (replaces the Speakers
+// tab) and ServiceBar (Jellyfin / YTM toggle, replaces the YTM tab); nav reduced
+// to 4 tabs (Search, Browse, Queue, Now Playing). The active service drives what
+// Search/Browse show. Every track row has a play button (starts immediately) and
+// a + button (enqueues without interrupting); + shows a brief "Added to queue"
+// toast. No playback/transport/queue logic changed — UI layer only.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -14,6 +20,10 @@ const html = htm.bind(h);
 
 // ── Card config (set in setConfig, read module-wide) ────────────
 let _smcConfig = {};
+
+// Active media service — drives what the Search and Browse tabs show.
+// 'jf' = Jellyfin, 'ytm' = YouTube Music. Toggled by the ServiceBar.
+let _smcService = 'jf';
 
 // ── Jellyfin config + client ────────────────────────────────────
 let _jellyfinUrl = null;          // public, browser-facing (browse + images)
@@ -369,6 +379,29 @@ async function playYtmTrack(hass, eid, videoId, meta = {}, queue = null) {
   }
 }
 
+// Append a single YTM track to the queue without interrupting playback
+// (enqueue=add). Mirrors it into the card-side YTM queue. The speaker resolves
+// the .m4a redirect itself when it reaches the track, so this returns fast.
+async function enqueueYtmTrack(hass, eid, track) {
+  if (!hass || !eid || !_ytmServiceUrl) return false;
+  const videoId = track.videoId || track.id;
+  if (!videoId) return false;
+  // Scope the card-side queue to this speaker (mirrors enqueueJfTracks).
+  if (_ytmQueueEntityId !== eid) { _ytmQueue = []; _ytmQueueEntityId = eid; }
+  const url = `${_ytmServiceUrl}/audio/${encodeURIComponent(videoId)}.m4a`;
+  try {
+    await hass.callService('media_player', 'play_media', {
+      entity_id: eid, media_content_id: url, media_content_type: 'music', enqueue: 'add',
+    });
+    _ytmQueue.push(toYtmQueueItem(track));
+    _ytmDirty = true;
+    return true;
+  } catch (err) {
+    console.error('[smc] YTM enqueue failed:', err);
+    return false;
+  }
+}
+
 // Index of a featuring marker in an artist name, handling both spellings
 // Jellyfin uses: " feat." and " featuring ". Returns the earliest, or -1.
 function getFeatIndex(name) {
@@ -457,6 +490,7 @@ const IconRepeat = () => html`<svg width="16" height="16" viewBox="0 0 24 24" fi
 const IconChevron = () => html`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>`;
 const IconMusicNote = () => html`<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
 const IconYTM = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M23.5 6.19a3.02 3.02 0 0 0-2.12-2.14C19.54 3.5 12 3.5 12 3.5s-7.54 0-9.38.55A3.02 3.02 0 0 0 .5 6.19C0 8.04 0 12 0 12s0 3.96.5 5.81a3.02 3.02 0 0 0 2.12 2.14C4.46 20.5 12 20.5 12 20.5s7.54 0 9.38-.55a3.02 3.02 0 0 0 2.12-2.14C24 15.96 24 12 24 12s0-3.96-.5-5.81zM9.75 15.5v-7l6.5 3.5-6.5 3.5z"/></svg>`;
+const IconPlus = () => html`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`;
 
 // ── Styles ──────────────────────────────────────────────────────
 const cardStyles = `
@@ -839,6 +873,77 @@ const cardStyles = `
   .smc-queue-now {
     color: ${THEME.primary}; flex-shrink: 0; display: flex; align-items: center;
   }
+
+  /* ── Speaker bar (always-visible, top of card) ── */
+  .smc-speaker-bar {
+    background: #0a0a0a; padding: 10px 12px;
+    border-bottom: 1px solid #222; flex-shrink: 0;
+  }
+  .smc-speaker-bar-label {
+    font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em;
+    color: #444; margin-bottom: 6px;
+  }
+  .smc-chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .smc-chip {
+    display: flex; align-items: center; gap: 5px;
+    border-radius: 20px; padding: 4px 11px; font-size: 11px;
+    cursor: pointer; font-family: inherit;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .smc-chip:active { opacity: 0.8; }
+  .smc-spk-chip { background: #1c1c1c; border: 1px solid #2e2e2e; color: #666; }
+  .smc-spk-chip.selected { background: #0f1f3d; border-color: #3b82f6; color: #93c5fd; }
+  .smc-chip-dot { width: 6px; height: 6px; border-radius: 50%; background: ${THEME.primary}; flex-shrink: 0; }
+  .smc-inline-group {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    margin-top: 8px; background: ${THEME.accent}; color: ${THEME.accentDark};
+    border-radius: 8px; padding: 7px 12px; cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .smc-inline-group:active { opacity: 0.85; }
+  .smc-inline-group-names {
+    flex: 1; min-width: 0; font-size: 12px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .smc-inline-group-action { font-size: 13px; font-weight: 700; white-space: nowrap; }
+
+  /* ── Service bar (Jellyfin / YouTube Music toggle) ── */
+  .smc-service-bar {
+    background: #0d0d0d; padding: 7px 12px;
+    border-bottom: 1px solid #222; display: flex; gap: 6px; flex-shrink: 0;
+  }
+  .smc-svc-chip { background: #1c1c1c; border: 1px solid #2e2e2e; color: #666; }
+  .smc-svc-chip svg { width: 13px; height: 13px; }
+  .smc-svc-chip.jf.active { background: #0d1a2e; border-color: #14b8a6; color: #5eead4; }
+  .smc-svc-chip.ytm.active { background: #1a0a0a; border-color: #dc2626; color: #f87171; }
+
+  /* ── Play + Queue buttons (every track row) ── */
+  .smc-track-btns { display: flex; gap: 5px; flex-shrink: 0; }
+  .smc-tb {
+    width: 28px; height: 28px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; border: none; padding: 0;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .smc-tb:active { opacity: 0.8; }
+  .smc-tb-play { background: ${THEME.primary}; color: #fff; }
+  .smc-tb-queue { background: #1c1c1c; border: 1px solid #2e2e2e; color: #666; }
+
+  /* ── Toast (brief confirmation, above the mini-player) ── */
+  .smc-toast {
+    position: absolute; left: 50%; transform: translateX(-50%); bottom: 70px;
+    background: ${THEME.accent}; color: ${THEME.accentDark};
+    padding: 5px 14px; border-radius: 20px;
+    font-size: 11px; font-weight: 500; white-space: nowrap;
+    z-index: 5; pointer-events: none;
+    animation: smc-toast-fade 1.8s ease forwards;
+  }
+  @keyframes smc-toast-fade {
+    0% { opacity: 0; }
+    12% { opacity: 1; }
+    80% { opacity: 1; }
+    100% { opacity: 0; }
+  }
 `;
 
 // ── Now-playing helpers ─────────────────────────────────────────
@@ -952,89 +1057,81 @@ function formatTime(s) {
   return `${m}:${sec < 10 ? '0' : ''}${sec}`;
 }
 
-// ── Speaker Row ─────────────────────────────────────────────────
-function SpeakerRow({ entityId, hass, selected, onToggle }) {
-  const state = hass.states[entityId];
-  const name = state?.attributes?.friendly_name || entityId.replace('media_player.', '');
-  const isPlaying = state?.state === 'playing';
-  const isGrouped = (state?.attributes?.group_members?.length || 0) > 1;
-  const isOff = state?.state === 'off';
-  const vol = state?.attributes?.volume_level;
-  const volPct = vol != null ? `${Math.round(vol * 100)}%` : '';
-  const title = state?.attributes?.media_title;
-
-  let subtext = 'Idle';
-  if (isOff) subtext = 'Off';
-  else if (isPlaying && title) subtext = `Playing · ${title}`;
-  else if (isGrouped) subtext = 'Grouped';
-
+// ── Play + Queue buttons (every track row) ──────────────────────
+// Two circular buttons shown on the right of a track row. Play starts the track
+// immediately; + enqueues it without interrupting playback. `loading` swaps the
+// play button for a spinner (YTM stream resolve). Both stop event propagation so
+// the row's own handler (if any) doesn't also fire.
+function TrackButtons({ onPlay, onQueue, loading }) {
   return html`
-    <div class=${`smc-spk-row${selected ? ' selected' : ''}`}
-         onClick=${() => onToggle(entityId)}>
-      <div class=${`smc-chk${selected ? ' checked' : ''}`}>
-        ${selected ? '✓' : ''}
-      </div>
-      <div class="smc-spk-icon">♪</div>
-      <div class="smc-spk-info">
-        <p class=${`smc-spk-name${!selected && !isPlaying ? ' muted' : ''}`}>
-          ${name}
-        </p>
-        <p class=${`smc-spk-sub${isPlaying ? ' playing' : isOff ? ' off' : ''}`}>
-          ${subtext}
-        </p>
-      </div>
-      ${volPct && html`<span class="smc-spk-vol">${volPct}</span>`}
+    <div class="smc-track-btns">
+      ${loading
+        ? html`<div class="smc-row-spinner"></div>`
+        : html`<button class="smc-tb smc-tb-play" title="Play"
+            onClick=${(e) => { e.stopPropagation(); onPlay(); }}><${IconPlay} size=${13} /></button>`}
+      <button class="smc-tb smc-tb-queue" title="Add to queue"
+        onClick=${(e) => { e.stopPropagation(); onQueue(); }}><${IconPlus} /></button>
     </div>
   `;
 }
 
-// ── Speakers View ───────────────────────────────────────────────
-function SpeakersView({ hass, selected, onSelect, onGroup, isPlaying }) {
+// ── Speaker Bar (always-visible, top of card) ───────────────────
+// Replaces the old Speakers tab. Speakers render as pill chips; tapping toggles
+// selection via the existing smcSelectSpeaker handler. When 2+ are selected an
+// inline "Play here ▶" group bar appears (same join logic as handleGroup).
+function SpeakerBar({ hass, selected, onSelect, onGroup, isPlaying }) {
   const speakers = useMemo(() => getSpeakers(hass).slice().sort(), [hass]);
-
   const selectedNames = useMemo(() =>
     selected.map(id => hass?.states[id]?.attributes?.friendly_name || id.replace('media_player.', '')),
   [selected, hass]);
 
-  const selectAll = useCallback(() => {
-    speakers.forEach(id => { if (!selected.includes(id)) onSelect(id); });
-  }, [speakers, selected, onSelect]);
-  const selectNone = useCallback(() => {
-    selected.forEach(id => onSelect(id));
-  }, [selected, onSelect]);
-
   return html`
-    <div class="smc-content">
-      ${speakers.length === 0 && html`<p class="smc-error">No speakers found</p>`}
-      ${speakers.length > 0 && html`
-        <div class="smc-spk-header">
-          <span class="smc-spk-title">Select speakers</span>
-          <div class="smc-spk-quick">
-            <span onClick=${selectAll}>All</span>
-            <span style="color:${THEME.border}">·</span>
-            <span onClick=${selectNone} style="color:${THEME.muted}">None</span>
+    <div class="smc-speaker-bar">
+      <div class="smc-speaker-bar-label">Speakers</div>
+      ${speakers.length === 0
+        ? html`<p class="smc-error" style="padding:0;text-align:left;font-size:11px;">No speakers found</p>`
+        : html`
+          <div class="smc-chip-row">
+            ${speakers.map(id => {
+              const state = hass.states[id];
+              const name = state?.attributes?.friendly_name || id.replace('media_player.', '');
+              const sel = selected.includes(id);
+              const playing = state?.state === 'playing';
+              return html`
+                <button key=${id} class=${`smc-chip smc-spk-chip${sel ? ' selected' : ''}`}
+                  onClick=${() => onSelect(id)}>
+                  ${playing && html`<span class="smc-chip-dot"></span>`}${name}
+                </button>
+              `;
+            })}
           </div>
+        `}
+      ${selected.length >= 2 && html`
+        <div class="smc-inline-group" onClick=${onGroup}>
+          <span class="smc-inline-group-names">${selectedNames.join(' + ')}</span>
+          <span class="smc-inline-group-action">Play here ▶</span>
         </div>
-        ${speakers.map(id => html`
-          <${SpeakerRow} key=${id} entityId=${id} hass=${hass}
-            selected=${selected.includes(id)} onToggle=${onSelect} />
-        `)}
       `}
     </div>
-    ${selected.length >= 2 && html`
-      <div class="smc-group-bar" onClick=${onGroup}>
-        <div>
-          <span class="smc-group-names">${selectedNames.join(' + ')}</span>
-          ${isPlaying && html`<div class="smc-group-warn">Changing group will briefly pause playback</div>`}
-        </div>
-        <span class="smc-group-action">Play here ▶</span>
-      </div>
-    `}
+  `;
+}
+
+// ── Service Bar (Jellyfin / YouTube Music toggle) ───────────────
+// Replaces the old YTM tab. One service active at a time; the choice drives what
+// the Search and Browse tabs render (see SonosMusicApp).
+function ServiceBar({ service, onService }) {
+  return html`
+    <div class="smc-service-bar">
+      <button class=${`smc-chip smc-svc-chip jf${service === 'jf' ? ' active' : ''}`}
+        onClick=${() => onService('jf')}>Jellyfin</button>
+      <button class=${`smc-chip smc-svc-chip ytm${service === 'ytm' ? ' active' : ''}`}
+        onClick=${() => onService('ytm')}><${IconYTM} />YouTube Music</button>
+    </div>
   `;
 }
 
 // ── Browse View (Jellyfin) ──────────────────────────────────────
-function BrowseView({ hass, selectedSpeakers }) {
+function BrowseView({ hass, selectedSpeakers, onTabChange, onToast }) {
   const [stack, setStack] = useState([{ kind: 'root', title: 'Library' }]);
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -1127,11 +1224,9 @@ function BrowseView({ hass, selectedSpeakers }) {
           ${rows.length === 0 && html`<p class="smc-loading">No items found</p>`}
           ${rows.map(row => {
             const img = row.imageTag ? jfImageUrl(row.id, row.imageTag) : null;
-            const onTap = row.track
-              ? () => playList(row.trackIndex)
-              : () => push(row.next);
             return html`
-              <div key=${row.id} class="smc-browse-row" onClick=${onTap}>
+              <div key=${row.id} class="smc-browse-row"
+                onClick=${row.track ? undefined : () => push(row.next)}>
                 ${img
                   ? html`<img class="smc-browse-thumb" src=${img} alt="" loading="eager" />`
                   : html`<div class="smc-browse-thumb-placeholder">${row.icon || (row.track ? '♪' : '\u{1F4C1}')}</div>`
@@ -1140,7 +1235,14 @@ function BrowseView({ hass, selectedSpeakers }) {
                   <p class="smc-browse-title">${row.name}</p>
                   ${row.subtitle && html`<p class="smc-browse-subtitle">${row.subtitle}</p>`}
                 </div>
-                ${!row.track && html`<span class="smc-browse-chevron">›</span>`}
+                ${row.track
+                  ? html`<${TrackButtons}
+                      onPlay=${() => { playList(row.trackIndex); onTabChange && onTabChange('playing'); }}
+                      onQueue=${async () => {
+                        await enqueueJfTracks(hassRef.current, eid, [{ id: row.id, name: row.name, subtitle: row.subtitle, imageTag: row.imageTag }]);
+                        onToast && onToast('Added to queue');
+                      }} />`
+                  : html`<span class="smc-browse-chevron">›</span>`}
               </div>
             `;
           })}
@@ -1151,7 +1253,7 @@ function BrowseView({ hass, selectedSpeakers }) {
 }
 
 // ── Search View (Jellyfin) ──────────────────────────────────────
-function SearchView({ hass, selectedSpeakers, onTabChange }) {
+function SearchView({ hass, selectedSpeakers, onTabChange, onToast }) {
   const [q, setQ] = useState('');
   const [results, setResults] = useState(null);   // { artists, albums, tracks } | null
   const [searching, setSearching] = useState(false);
@@ -1294,11 +1396,9 @@ function SearchView({ hass, selectedSpeakers, onTabChange }) {
             ${drillRows.length === 0 && html`<p class="smc-loading">No items found</p>`}
             ${drillRows.map(row => {
               const img = row.imageTag ? jfImageUrl(row.id, row.imageTag) : null;
-              const onTap = row.track
-                ? () => playAndShow(drillTrackMeta, row.trackIndex)
-                : () => pushDrill(row.next);
               return html`
-                <div key=${row.id} class="smc-browse-row" onClick=${onTap}>
+                <div key=${row.id} class="smc-browse-row"
+                  onClick=${row.track ? undefined : () => pushDrill(row.next)}>
                   ${img
                     ? html`<img class="smc-browse-thumb" src=${img} alt="" loading="eager" />`
                     : html`<div class="smc-browse-thumb-placeholder">${row.icon || (row.track ? '♪' : '\u{1F4C1}')}</div>`
@@ -1307,7 +1407,14 @@ function SearchView({ hass, selectedSpeakers, onTabChange }) {
                     <p class="smc-browse-title">${row.name}</p>
                     ${row.subtitle && html`<p class="smc-browse-subtitle">${row.subtitle}</p>`}
                   </div>
-                  ${!row.track && html`<span class="smc-browse-chevron">›</span>`}
+                  ${row.track
+                    ? html`<${TrackButtons}
+                        onPlay=${() => playAndShow(drillTrackMeta, row.trackIndex)}
+                        onQueue=${async () => {
+                          await enqueueJfTracks(hassRef.current, eid, [{ id: row.id, name: row.name, subtitle: row.subtitle, imageTag: row.imageTag }]);
+                          onToast && onToast('Added to queue');
+                        }} />`
+                    : html`<span class="smc-browse-chevron">›</span>`}
                 </div>
               `;
             })}
@@ -1374,18 +1481,26 @@ function SearchView({ hass, selectedSpeakers, onTabChange }) {
         ${results.tracks.length > 0 && html`
           <p class="smc-section-label">Tracks</p>
           <div class="smc-browse-list">
-            ${results.tracks.map(t => html`
-              <div key=${t.Id} class="smc-browse-row"
-                onClick=${() => playAndShow([{ id: t.Id, name: t.Name, subtitle: (t.Artists && t.Artists.join(', ')) || t.AlbumArtist || '', imageTag: t.ImageTags?.Primary }], 0)}>
-                ${t.ImageTags?.Primary
-                  ? html`<img class="smc-browse-thumb" src=${jfImageUrl(t.Id, t.ImageTags.Primary)} alt="" loading="eager" />`
-                  : html`<div class="smc-browse-thumb-placeholder">♪</div>`}
-                <div class="smc-browse-info">
-                  <p class="smc-browse-title">${t.Name}</p>
-                  <p class="smc-browse-subtitle">${(t.Artists && t.Artists.join(', ')) || t.AlbumArtist || ''}</p>
+            ${results.tracks.map(t => {
+              const meta = { id: t.Id, name: t.Name, subtitle: (t.Artists && t.Artists.join(', ')) || t.AlbumArtist || '', imageTag: t.ImageTags?.Primary };
+              return html`
+                <div key=${t.Id} class="smc-browse-row">
+                  ${t.ImageTags?.Primary
+                    ? html`<img class="smc-browse-thumb" src=${jfImageUrl(t.Id, t.ImageTags.Primary)} alt="" loading="eager" />`
+                    : html`<div class="smc-browse-thumb-placeholder">♪</div>`}
+                  <div class="smc-browse-info">
+                    <p class="smc-browse-title">${t.Name}</p>
+                    <p class="smc-browse-subtitle">${meta.subtitle}</p>
+                  </div>
+                  <${TrackButtons}
+                    onPlay=${() => playAndShow([meta], 0)}
+                    onQueue=${async () => {
+                      await enqueueJfTracks(hassRef.current, eid, [meta]);
+                      onToast && onToast('Added to queue');
+                    }} />
                 </div>
-              </div>
-            `)}
+              `;
+            })}
           </div>
         `}
       `}
@@ -1394,7 +1509,7 @@ function SearchView({ hass, selectedSpeakers, onTabChange }) {
 }
 
 // ── YouTube Music View (ytm-service) ────────────────────────────
-function YTMView({ hass, selectedSpeakers, onTabChange }) {
+function YTMView({ hass, selectedSpeakers, onTabChange, onToast }) {
   const [q, setQ] = useState('');
   const [type, setType] = useState('songs');      // songs | albums | artists
   const [results, setResults] = useState(null);   // [{type, id, title, artist, album, thumbnail}] | null
@@ -1538,13 +1653,15 @@ function YTMView({ hass, selectedSpeakers, onTabChange }) {
           <div class="smc-browse-list">
             ${albumTracks.length === 0 && html`<p class="smc-loading">No tracks found</p>`}
             ${albumTracks.map(t => html`
-              <div key=${t.id} class="smc-browse-row" onClick=${() => tapSong(t)}>
+              <div key=${t.id} class="smc-browse-row">
                 ${thumb(t.thumbnail, '♪')}
                 <div class="smc-browse-info">
                   <p class="smc-browse-title">${t.title}</p>
                   ${t.artist && html`<p class="smc-browse-subtitle">${t.artist}</p>`}
                 </div>
-                ${loadingId === t.id && html`<div class="smc-row-spinner"></div>`}
+                <${TrackButtons} loading=${loadingId === t.id}
+                  onPlay=${() => tapSong(t)}
+                  onQueue=${async () => { await enqueueYtmTrack(hassRef.current, eid, t); onToast && onToast('Added to queue'); }} />
               </div>
             `)}
           </div>
@@ -1575,13 +1692,15 @@ function YTMView({ hass, selectedSpeakers, onTabChange }) {
           ${results.map(r => {
             if (r.type === 'songs') {
               return html`
-                <div key=${r.id} class="smc-browse-row" onClick=${() => tapSong(r)}>
+                <div key=${r.id} class="smc-browse-row">
                   ${thumb(r.thumbnail, '♪')}
                   <div class="smc-browse-info">
                     <p class="smc-browse-title">${r.title}</p>
                     ${r.artist && html`<p class="smc-browse-subtitle">${r.artist}</p>`}
                   </div>
-                  ${loadingId === r.id && html`<div class="smc-row-spinner"></div>`}
+                  <${TrackButtons} loading=${loadingId === r.id}
+                    onPlay=${() => tapSong(r)}
+                    onQueue=${async () => { await enqueueYtmTrack(hassRef.current, eid, r); onToast && onToast('Added to queue'); }} />
                 </div>
               `;
             }
@@ -1908,11 +2027,9 @@ function MiniPlayer({ nowPlaying, hass, onTap }) {
 // ── Bottom Nav ──────────────────────────────────────────────────
 function BottomNav({ activeTab, onTabChange }) {
   const tabs = [
-    { id: 'speakers', label: 'Speakers', icon: IconSpeaker },
     { id: 'search', label: 'Search', icon: IconSearch },
     { id: 'browse', label: 'Browse', icon: IconBrowse },
     { id: 'queue', label: 'Queue', icon: IconQueue },
-    { id: 'ytm', label: 'YTM', icon: IconYTM },
     { id: 'playing', label: 'Now Playing', icon: IconNowPlaying },
   ];
   return html`
@@ -2018,7 +2135,10 @@ function smcSelectSpeaker(entityId, hass) {
 
 // ── App ─────────────────────────────────────────────────────────
 function SonosMusicApp({ hass, config }) {
-  const [activeTab, setActiveTab] = useState('speakers');
+  const [activeTab, setActiveTab] = useState('browse');
+  const [service, setServiceState] = useState(_smcService);  // 'jf' | 'ytm'
+  const [toast, setToast] = useState(null);                  // brief confirmation text | null
+  const toastTimer = useRef(null);
   // Force re-render counter — bumped when user taps a speaker
   const [, forceUpdate] = useState(0);
 
@@ -2066,35 +2186,58 @@ function SonosMusicApp({ hass, config }) {
     } catch (err) { console.error('[smc] Group failed:', err); }
   }, [hass, selectedSpeakers]);
 
+  // Service toggle — mirror into module state so the views read it consistently,
+  // and into React state so the panels re-render/re-fetch.
+  const setService = useCallback((s) => { _smcService = s; setServiceState(s); }, []);
+
+  // One-at-a-time toast: shown, then auto-dismissed after 1.8s (the CSS animation
+  // handles the fade; unmounting at the same time keeps only one toast alive).
+  const showToast = useCallback((msg) => {
+    setToast(msg);
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 1800);
+  }, []);
+
   if (!hass) {
     return html`<div class="smc-card"><p class="smc-error">Waiting for HA connection...</p></div>`;
   }
 
+  // The active service decides what Search/Browse show. Jellyfin keeps separate
+  // Search and Browse panels; YTM uses a single panel shown under either tab.
+  const jfSearchVisible = activeTab === 'search' && service === 'jf';
+  const jfBrowseVisible = activeTab === 'browse' && service === 'jf';
+  const ytmVisible = (activeTab === 'search' || activeTab === 'browse') && service === 'ytm';
+
   return html`
     <div class="smc-card">
+      <${SpeakerBar} hass=${hass} selected=${selectedSpeakers}
+        onSelect=${handleSelectSpeaker} onGroup=${handleGroup} isPlaying=${isPlaying} />
+      <${ServiceBar} service=${service} onService=${setService} />
       <${BottomNav} activeTab=${activeTab} onTabChange=${setActiveTab} />
-      <div class=${`smc-tab-panel${activeTab !== 'speakers' ? ' hidden' : ''}`}>
-        <${SpeakersView} hass=${hass} selected=${selectedSpeakers}
-          onSelect=${handleSelectSpeaker} onGroup=${handleGroup} isPlaying=${isPlaying} />
+
+      <div class=${`smc-tab-panel${jfSearchVisible ? '' : ' hidden'}`}>
+        <${SearchView} hass=${hass} selectedSpeakers=${selectedSpeakers}
+          onTabChange=${setActiveTab} onToast=${showToast} />
       </div>
-      <div class=${`smc-tab-panel${activeTab !== 'search' ? ' hidden' : ''}`}>
-        <${SearchView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
+      <div class=${`smc-tab-panel${jfBrowseVisible ? '' : ' hidden'}`}>
+        <${BrowseView} hass=${hass} selectedSpeakers=${selectedSpeakers}
+          onTabChange=${setActiveTab} onToast=${showToast} />
       </div>
-      <div class=${`smc-tab-panel${activeTab !== 'browse' ? ' hidden' : ''}`}>
-        <${BrowseView} hass=${hass} selectedSpeakers=${selectedSpeakers} />
+      <div class=${`smc-tab-panel${ytmVisible ? '' : ' hidden'}`}>
+        <${YTMView} hass=${hass} selectedSpeakers=${selectedSpeakers}
+          onTabChange=${setActiveTab} onToast=${showToast} />
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'queue' ? ' hidden' : ''}`}>
         <${QueueView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
       </div>
-      <div class=${`smc-tab-panel${activeTab !== 'ytm' ? ' hidden' : ''}`}>
-        <${YTMView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
-      </div>
       <div class=${`smc-tab-panel${activeTab !== 'playing' ? ' hidden' : ''}`}>
         <${NowPlayingView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} />
       </div>
+
       ${activeTab !== 'playing' && html`
         <${MiniPlayer} nowPlaying=${nowPlaying} hass=${hass} onTap=${() => setActiveTab('playing')} />
       `}
+      ${toast && html`<div class="smc-toast">${toast}</div>`}
     </div>
   `;
 }
