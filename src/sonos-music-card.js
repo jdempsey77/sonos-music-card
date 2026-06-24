@@ -1,4 +1,4 @@
-// Sonos Music Card v0.17.1
+// Sonos Music Card v0.17.2
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -16,6 +16,11 @@
 // paths cross-clear the opposing service; speaker chips ARE the group (tap to
 // add re-joins, tap to remove unjoins — no separate "Play here" CTA);
 // ServiceBar hidden on Queue / Now Playing; unified Add-All toast feedback.
+// v0.17.2: Jellyfin now-playing art prefers jfNowPlayingArt() over the HA
+// entity_picture proxy (which 404s for native Sonos entities); YTM album drill
+// gained an Add All button; YTM next/prev handled card-side via _ytmQueue (HA
+// media_next/previous_track no-op for non-native YTM queue); localStorage access
+// routed through a safe wrapper to silence tracking-prevention console spam.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -892,7 +897,7 @@ function buildNpInfo(id, state, service = _smcService) {
     title: a.media_title || 'Unknown',
     artist: a.media_artist || '',
     album: a.media_album_name || '',
-    art: smcResolveImage(a.entity_picture),
+    art: jfNowPlayingArt() || smcResolveImage(a.entity_picture),
     isPlaying: state.state === 'playing',
     isExternal: isExternalSource(state),
     source: a.source || null,
@@ -912,7 +917,6 @@ function buildNpInfo(id, state, service = _smcService) {
   } else {
     // Jellyfin active: source cover art from Jellyfin when HA gives us none.
     // Never read YTM metadata.
-    info.art = info.art || jfNowPlayingArt();
   }
 
   return info;
@@ -1539,6 +1543,33 @@ function YTMView({ hass, selectedSpeakers, onTabChange, onToast }) {
     })();
   }, [albumTracks, eid, onTabChange]);
 
+  // Album Add All: enqueue every track without interrupting playback. Each track
+  // needs its own yt-dlp resolve, so this runs sequentially and may take a while.
+  const addAlbumAll = useCallback(async () => {
+    const ids = albumTracks.map(t => t.id).filter(Boolean);
+    if (!ids.length) return;
+    setAddState('adding');
+    let added = 0;
+    for (const t of albumTracks) {
+      const url = `${_ytmServiceUrl}/audio/${encodeURIComponent(t.id)}.m4a`;
+      try {
+        await hassRef.current.callService('media_player', 'play_media', {
+          entity_id: eid,
+          media_content_id: url,
+          media_content_type: 'music',
+          enqueue: 'add',
+        });
+        if (!_ytmQueue.find(q => q.videoId === t.id)) {
+          _ytmQueue.push(toYtmQueueItem(t));
+        }
+        added++;
+      } catch { break; }
+    }
+    _ytmQueueEntityId = eid;
+    setAddState(null);
+    if (onToast) onToast(`Added ${added} tracks`);
+  }, [albumTracks, eid, onToast]);
+
   const onInput = useCallback((e) => {
     setQ(e.target.value);
     setAlbum(a => (a ? null : a));   // editing query drops out of album drill
@@ -1583,6 +1614,9 @@ function YTMView({ hass, selectedSpeakers, onTabChange, onToast }) {
           <div class="smc-action-bar">
             <button class="smc-action-btn primary" disabled=${addState === 'starting'} onClick=${playAlbumAll}>
               ${addState === 'starting' ? 'Starting…' : '▶ Play All'}
+            </button>
+            <button class="smc-action-btn" disabled=${addState === 'adding'} onClick=${addAlbumAll}>
+              ${addState === 'adding' ? 'Adding…' : '+ Add All'}
             </button>
           </div>
         `}
@@ -1804,8 +1838,49 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
   }, [np, selectedSpeakers]);
 
   const handlePlayPause = useCallback(() => callService('media_play_pause', {}), [callService]);
-  const handlePrev = useCallback(() => callService('media_previous_track', {}), [callService]);
-  const handleNext = useCallback(() => callService('media_next_track', {}), [callService]);
+
+  // YTM tracks are not a native Sonos queue, so HA media_next_track /
+  // media_previous_track do nothing for YTM playback. Handle next/prev card-side
+  // by resolving the adjacent track in _ytmQueue and playing it directly.
+  const handleNext = useCallback(async () => {
+    if (_smcService === 'ytm' && _ytmQueue.length > 0) {
+      const currentIdx = _ytmQueue.findIndex(t => t.videoId === _ytmNowPlaying?.videoId);
+      const nextTrack = _ytmQueue[currentIdx + 1];
+      if (!nextTrack) return;
+      const url = `${_ytmServiceUrl}/audio/${encodeURIComponent(nextTrack.videoId)}.m4a`;
+      _ytmNowPlaying = { videoId: nextTrack.videoId, title: nextTrack.title, artist: nextTrack.artist, thumbnail: nextTrack.thumbnail };
+      _ytmDirty = true;
+      try {
+        await hassRef.current.callService('media_player', 'play_media', {
+          entity_id: entityId,
+          media_content_id: url,
+          media_content_type: 'music',
+        });
+      } catch (err) { console.error('[smc] YTM next failed:', err); }
+      return;
+    }
+    callService('media_next_track', {});
+  }, [callService, entityId]);
+
+  const handlePrev = useCallback(async () => {
+    if (_smcService === 'ytm' && _ytmQueue.length > 0) {
+      const currentIdx = _ytmQueue.findIndex(t => t.videoId === _ytmNowPlaying?.videoId);
+      const prevTrack = _ytmQueue[currentIdx - 1];
+      if (!prevTrack) return;
+      const url = `${_ytmServiceUrl}/audio/${encodeURIComponent(prevTrack.videoId)}.m4a`;
+      _ytmNowPlaying = { videoId: prevTrack.videoId, title: prevTrack.title, artist: prevTrack.artist, thumbnail: prevTrack.thumbnail };
+      _ytmDirty = true;
+      try {
+        await hassRef.current.callService('media_player', 'play_media', {
+          entity_id: entityId,
+          media_content_id: url,
+          media_content_type: 'music',
+        });
+      } catch (err) { console.error('[smc] YTM prev failed:', err); }
+      return;
+    }
+    callService('media_previous_track', {});
+  }, [callService, entityId]);
 
   const handleShuffle = useCallback(() => {
     if (!np) return;
@@ -1991,6 +2066,28 @@ let _ytmDirty = false; // set when _ytmNowPlaying changes — signals Preact to 
 let _smcUserSelected = false; // true after explicit user tap — blocks auto-detect
 let _smcUserSelectedAt = 0; // timestamp of last user tap
 
+// Safe localStorage wrapper — Edge/Chromium tracking prevention blocks
+// localStorage in some HA contexts, causing console spam. Fall back to
+// in-memory only when storage is unavailable.
+let _storageAvailable = null;
+function storageAvailable() {
+  if (_storageAvailable !== null) return _storageAvailable;
+  try {
+    localStorage.setItem('_smc_test', '1');
+    localStorage.removeItem('_smc_test');
+    _storageAvailable = true;
+  } catch { _storageAvailable = false; }
+  return _storageAvailable;
+}
+function storageSave(key, value) {
+  if (!storageAvailable()) return;
+  try { localStorage.setItem(key, value); } catch {}
+}
+function storageLoad(key) {
+  if (!storageAvailable()) return null;
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+
 function smcInit(hass) {
   const speakers = getSpeakers(hass);
 
@@ -1999,7 +2096,7 @@ function smcInit(hass) {
 
   // 2. localStorage (filtered to configured speakers)
   let saved = [];
-  try { saved = JSON.parse(localStorage.getItem(SMC_KEY) || '[]'); } catch {}
+  try { saved = JSON.parse(storageLoad(SMC_KEY) || '[]'); } catch {}
   saved = saved.filter(id => speakers.includes(id));
 
   // 3. Priority: playing > saved > empty
@@ -2048,7 +2145,7 @@ function smcAutoDetect(hass) {
     console.log('[smc] auto-detect: switching to', active);
     _smcSpeakers = [active];
     _smcDirty = true;
-    try { localStorage.setItem(SMC_KEY, JSON.stringify(_smcSpeakers)); } catch {}
+    storageSave(SMC_KEY, JSON.stringify(_smcSpeakers));
   }
 }
 
@@ -2091,7 +2188,7 @@ async function smcToggleSpeaker(entityId, hass) {
   _smcUserSelected = true;
   _smcUserSelectedAt = Date.now();
   _smcDirty = true;
-  try { localStorage.setItem(SMC_KEY, JSON.stringify(_smcSpeakers)); } catch {}
+  storageSave(SMC_KEY, JSON.stringify(_smcSpeakers));
 }
 
 // ── App ─────────────────────────────────────────────────────────
