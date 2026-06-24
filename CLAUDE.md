@@ -235,6 +235,18 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.17.3** — Jellyfin now-playing art falls back to **album art** when a track
+has no `Primary` image (some Jellyfin items only carry album-level art, so the
+track-level `/Items/{trackId}/Images/Primary` URL 404'd and Now Playing showed a
+placeholder). Track rows (`jfFetchRows` album + playlist cases), search track
+meta, `jfArtistTracks`, and `toQueueItem` now carry `albumId`; new module state
+`_smcNowPlayingJfAlbumId` mirrors `_smcNowPlayingJfId` (set in `playJfTracks` /
+`jumpToQueueTrack`, cleared everywhere `_smcNowPlayingJfId` is cleared —
+`playYtmTrack`, `enqueueYtmTrack`, idle). `jfNowPlayingArt()` returns track art
+when present, else album art. The NowPlayingView `<img>` also gets an `onError`
+handler that swaps to album art once if the track-level URL 404s at render time,
+then hides the img if that also fails.
+
 **v0.17.2** — Four targeted fixes. (1) **Jellyfin now-playing art 404**:
 `buildNpInfo` now sets `art: jfNowPlayingArt() || smcResolveImage(a.entity_picture)`
 — the HA `entity_picture` proxy returns a non-null URL that 404s for native Sonos
@@ -374,6 +386,7 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [x] YTM album drill Add All button — v0.17.2 (`addAlbumAll`)
 - [x] YTM next/prev (card-side, HA next/prev no-op for non-native queue) — v0.17.2
 - [x] Jellyfin now-playing art 404 (prefer `jfNowPlayingArt()` over HA proxy) — v0.17.2
+- [x] Jellyfin now-playing art album fallback (track has no Primary image) — v0.17.3
 - [x] localStorage tracking-prevention console spam — v0.17.2 (safe storage wrapper)
 
 ## Session startup checklist
