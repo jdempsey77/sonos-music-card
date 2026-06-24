@@ -15,15 +15,24 @@ Custom Home Assistant Lovelace card for Sonos speakers.
 Speaker selection, multi-room grouping, Now Playing with full transport controls,
 and a media browser backed by Jellyfin **and** YouTube Music.
 
-**Layout (v0.17.1+, top → bottom):** always-visible `SpeakerBar` (speaker chips —
+**Layout (v0.19.0, top → bottom):** always-visible `SpeakerBar` (speaker chips —
 the chips ARE the group, no separate CTA) → `ServiceBar` (Jellyfin / YouTube Music
 toggle; **hidden on Queue / Now Playing**) → `BottomNav` (4 tabs: Search · Browse ·
-Queue · Now Playing) → tab content → `MiniPlayer`. The active service
+Queue · Now Playing) → tab content → always-visible `BottomBar`. The active service
 (`_smcService`) is the **single source of truth** for all four tabs — it decides
 whether Search/Browse render Jellyfin or YTM content AND which source Queue / Now
-Playing / MiniPlayer read (not a playback heuristic). Every track row carries a
+Playing / BottomBar read (not a playback heuristic). Every track row carries a
 blue **play** button (starts immediately) and a gray **+** button (enqueues
 without interrupting; shows a brief "Added to queue" toast via `TrackButtons`).
+
+The **`BottomBar`** (v0.19.0, replaces the old hidden-on-Now-Playing MiniPlayer)
+is mounted on **every** tab: 40x40 art · title/artist · prev · play/pause circle ·
+next, plus a slim progress bar with timestamps. Tapping the bar (anywhere but the
+buttons) opens the **Now Playing** tab, which is now the **expanded view only** —
+art, title/artist, seek bar, shuffle/repeat, and volume sliders (no play/prev/next
+row; that transport lives in the BottomBar). Both share the module-level
+`transport*` helpers (`transportPlayPause` / `transportNext` / `transportPrev`),
+so YTM next/prev resolve the adjacent `_ytmQueue` track card-side identically.
 
 - **Control / transport**: native HA `media_player.*` services (HA reaches the speakers).
 - **Media browsing**: Jellyfin REST API, called directly from the card (browser).
@@ -96,19 +105,32 @@ function getSpeakers(hass, config = _smcConfig) {
 }
 ```
 
-### Layout components (v0.17.1)
+### Layout components (v0.19.0)
 - **`SpeakerBar`** — replaces the old `SpeakersView`/Speakers tab. Renders the
   configured speakers as pill chips (selected = blue, unselected = gray); a
-  playing speaker shows a dot. **The chips ARE the group (Model A):** tapping an
-  unselected chip adds it and re-joins the whole selection under the primary
-  (first selected) coordinator, resuming playback if anything was playing; tapping
-  a selected chip removes it and unjoins (stops) that speaker. Handled by
-  `smcToggleSpeaker` — there is no separate "Play here" CTA. Always visible at top.
+  selected chip that is also playing shows a blue dot before the name (the dot is
+  gated on **selected AND playing**, not playing alone). **The chips are clean
+  on/off (v0.19.0, simplified from the old Model A unjoin-all-and-rejoin dance):**
+  tapping an OFF chip adds it to the selection and — if something is playing —
+  joins it to the active coordinator (first selected speaker) via a single
+  `media_player.join`; if nothing is playing it just adds it (becomes the target
+  for the next play). Tapping an ON chip unjoins it (stops it) and drops it from
+  the selection. The **last** remaining speaker can never be deselected. Handled by
+  `smcToggleSpeaker` — no separate "Play here" CTA. Always visible at top.
 - **`ServiceBar`** — Jellyfin / YouTube Music toggle, drives `_smcService`.
   Active Jellyfin = teal accent, active YTM = red accent. **Rendered only on the
   Search / Browse tabs** (a dead control on Queue / Now Playing; hidden + collapsed
   there).
 - **`BottomNav`** — 4 tabs only: Search, Browse, Queue, Now Playing.
+- **`BottomBar`** (v0.19.0, replaces `MiniPlayer`) — always-mounted persistent
+  transport at the bottom of the card: 40x40 art · title/artist · prev · play/pause
+  circle · next, plus a slim progress bar with timestamps. Tapping it (not the
+  buttons) opens Now Playing. Nothing playing → placeholder art, "Nothing playing",
+  disabled play button. Uses the shared `transport*` helpers (same callService path
+  as NowPlayingView; YTM next/prev resolve the adjacent `_ytmQueue` track card-side).
+- **`NowPlayingView`** is the **expanded view only** (v0.19.0) — art, title/artist,
+  seek bar, shuffle/repeat modes (above volume), and volume sliders. The play/prev/
+  next transport row was removed (it lives in the BottomBar now).
 - **`TrackButtons`** — the play + `+` button pair on every track row. Play calls
   the existing play path and jumps to Now Playing; `+` calls the existing enqueue
   path (`enqueueJfTracks` / `enqueueYtmTrack`) and fires the "Added to queue"
@@ -116,7 +138,7 @@ function getSpeakers(hass, config = _smcConfig) {
 - **Service routing** lives in `SonosMusicApp`: `_smcService` is the single source
   of truth for **all four tabs**. Jellyfin keeps separate Search and Browse panels;
   YTM uses a single `YTMView` panel shown under either tab. Queue / Now Playing /
-  MiniPlayer also read `_smcService` directly (not a playback heuristic) — switching
+  BottomBar also read `_smcService` directly (not a playback heuristic) — switching
   the service instantly re-scopes every tab. All panels stay mounted (hidden via
   CSS) so per-view state persists across tabs.
 
@@ -137,7 +159,8 @@ let _smcDirty = false        // signals Preact to re-render after auto-detect ch
 |---|---|
 | `smcInit(hass)` | Cold load. Seeds `_smcSpeakers` from playing state or localStorage |
 | `smcAutoDetect(hass)` | Every hass update. Promotes a playing speaker if nothing selected |
-| `smcToggleSpeaker(entityId, hass)` | Chip toggle = group membership (Model A). Add → re-join under primary + resume; remove → unjoin. Async; `_smcSpeakers` mutates synchronously for optimistic UI. Sets `_smcUserSelected = true` |
+| `smcToggleSpeaker(entityId, hass)` | Chip toggle = group membership (clean on/off, v0.19.0). Add → simple `join` to the active coordinator if something's playing, else just select; remove → `unjoin` (stops). Last speaker can't be removed. Async; `_smcSpeakers` mutates synchronously for optimistic UI. Sets `_smcUserSelected = true` |
+| `transportPlayPause/Next/Prev(hass, entityId)` | Shared transport (v0.19.0) used by both BottomBar and NowPlayingView. Native/Jellyfin → HA `media_*` services; YTM → resolve adjacent `_ytmQueue` track card-side |
 | `hasMediaContext(state)` | True if playing, paused, or idle+title+mid-track |
 | `isExternalSource(state)` | True if playing from a non-queue source (TV, line-in) |
 | `getNowPlaying(hass, selected, service)` | Now-playing scoped to the active service (`_smcService`): YTM context = stored `_ytmNowPlaying`; Jellyfin context = live HA state. No cross-read |
@@ -235,6 +258,30 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.19.0** — Persistent bottom bar, speaker chip overhaul, album thumbnail fix.
+1. **`BottomBar` replaces `MiniPlayer`** — always mounted regardless of active tab
+   (the old MiniPlayer was hidden on Now Playing). Row 1: 40x40 art · title/artist ·
+   prev · play/pause circle (34x34, blue) · next. Row 2: slim 2px progress bar with
+   9px timestamps. Tapping the bar (not the buttons) opens Now Playing. Nothing
+   playing → placeholder art + "Nothing playing" + disabled play button (50%).
+2. **`NowPlayingView` is the expanded view only** — the play/prev/next transport
+   row was removed (now in the BottomBar). Keeps art, title/artist, seek bar,
+   shuffle/repeat (`.np-modes`, above volume), and volume sliders.
+3. **Shared transport helpers** — `transportPlayPause` / `transportNext` /
+   `transportPrev` are module-level and used by BOTH the BottomBar and
+   NowPlayingView, so they can't drift. YTM next/prev resolve the adjacent
+   `_ytmQueue` track card-side (HA `media_*_track` no-op for the non-native queue).
+4. **Speaker chip model simplified** — `smcToggleSpeaker` is now clean on/off (no
+   unjoin-all + rejoin dance). Tap OFF → add to selection; if something is playing,
+   a single `media_player.join` adds it to the active coordinator. Tap ON →
+   `media_player.unjoin` (stops it). Last speaker can't be deselected. The chip dot
+   shows only when the chip is **both** selected and playing.
+5. **Album thumbnails** — `jfImageUrl` now uses `maxHeight=96&maxWidth=96` (not
+   `fillHeight/fillWidth`, which 404s for items without a stored thumbnail at that
+   size). `imageTag: item.ImageTags?.Primary || null` is set consistently across
+   every `jfFetchRows` path (views/artists/albums/playlists/tracks) and
+   `jfArtistTracks`.
+
 **v0.18.0** — Targeted bug-fix pass (8 fixes, no architectural change):
 1. **Auto-detect latch (B1)** — `smcAutoDetect` ran on every ~1Hz hass push and
    never recorded its own choice, so two simultaneously-playing speakers made it
@@ -440,6 +487,9 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [x] Render-phase side effects / impure `getNowPlaying` (moved to effects) — v0.18.0
 - [x] YTM title/art lost after reload (recover from `media_content_id`) — v0.18.0
 - [x] Volume slider flooding HA (300ms debounce) — v0.18.0
+- [x] Persistent transport on every tab (BottomBar replaces MiniPlayer) — v0.19.0
+- [x] Speaker chip model simplified (clean join/unjoin, no rejoin dance) — v0.19.0
+- [x] Album thumbnails in Browse (maxHeight/maxWidth + imageTag audit) — v0.19.0
 - [~] Queue + YTM now-playing persistence across reload — **intentionally not
   implemented**: `localStorage` is blocked by Edge/Chromium tracking prevention in
   this HA/Edge environment, so card-side queue + `_ytmNowPlaying` are in-memory by

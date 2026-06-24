@@ -1,4 +1,4 @@
-// Sonos Music Card v0.18.0
+// Sonos Music Card v0.19.0
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -33,6 +33,16 @@
 // after a reload resets _smcService; art pipeline reordered so a 404ing HA proxy
 // is last resort (regex handles dashed GUIDs); last-speaker deselect guarded;
 // volume sliders fall back to the selected speakers; volume_set debounced 300ms.
+// v0.19.0: persistent BottomBar replaces the MiniPlayer — always mounted (every
+// tab), with 40x40 art, title/artist, prev/play/next, and a slim progress bar;
+// tapping it opens Now Playing. NowPlayingView is now the expanded view only
+// (art, title, seek, shuffle/repeat, volume) — play/prev/next moved to the
+// BottomBar via shared transport* helpers (YTM next/prev still card-side).
+// Speaker chips overhauled to clean on/off: tap OFF = join to the active
+// coordinator (simple join, no unjoin-all dance); tap ON = unjoin + stop; last
+// speaker can't be deselected; the playing dot shows only when selected+playing.
+// Album thumbnails: jfImageUrl uses maxHeight/maxWidth (not fillHeight/fillWidth)
+// and imageTag is set consistently across every jfFetchRows path.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -120,10 +130,12 @@ async function jfGetUserId() {
   return _jellyfinUserId;
 }
 
-// Primary image (public endpoint — no token required).
+// Primary image (public endpoint — no token required). Uses maxHeight/maxWidth
+// (not fillHeight/fillWidth) so Jellyfin returns art gracefully for items whose
+// stored thumbnail isn't at the requested size, instead of 404ing.
 function jfImageUrl(itemId, tag) {
   if (!_jellyfinUrl || !itemId) return null;
-  let u = `${_jellyfinUrl}/Items/${itemId}/Images/Primary?fillHeight=96&fillWidth=96&quality=90`;
+  let u = `${_jellyfinUrl}/Items/${itemId}/Images/Primary?maxHeight=96&maxWidth=96&quality=90`;
   if (tag) u += `&tag=${encodeURIComponent(tag)}`;
   return u;
 }
@@ -159,7 +171,7 @@ async function jfFetchRows(frame) {
       const views = (data?.Items || []).filter(v => v.CollectionType === 'music');
       return views.map(v => ({
         id: v.Id, name: v.Name, subtitle: 'Library',
-        imageTag: v.ImageTags?.Primary,
+        imageTag: v.ImageTags?.Primary || null,
         next: { kind: 'library', title: v.Name, libId: v.Id },
       }));
     }
@@ -173,7 +185,7 @@ async function jfFetchRows(frame) {
       const data = await jfGet(`/Artists?ParentId=${frame.libId}&Recursive=true&SortBy=SortName&SortOrder=Ascending&Limit=2000&UserId=${uid}`);
       return collapseFeaturingArtists((data?.Items || []).map(a => ({
         id: a.Id, name: a.Name, subtitle: 'Artist',
-        imageTag: a.ImageTags?.Primary,
+        imageTag: a.ImageTags?.Primary || null,
         next: { kind: 'artist', title: a.Name, artistId: a.Id },
       })));
     }
@@ -181,7 +193,7 @@ async function jfFetchRows(frame) {
       const data = await jfGet(`/Items?ParentId=${frame.libId}&IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=SortName&SortOrder=Ascending&Limit=2000&UserId=${uid}`);
       return (data?.Items || []).map(al => ({
         id: al.Id, name: al.Name, subtitle: al.AlbumArtist || 'Album',
-        imageTag: al.ImageTags?.Primary,
+        imageTag: al.ImageTags?.Primary || null,
         next: { kind: 'album', title: al.Name, albumId: al.Id },
       }));
     }
@@ -189,7 +201,7 @@ async function jfFetchRows(frame) {
       const data = await jfGet(`/Items?IncludeItemTypes=Playlist&Recursive=true&SortBy=SortName&Limit=500&UserId=${uid}`);
       return (data?.Items || []).map(pl => ({
         id: pl.Id, name: pl.Name, subtitle: 'Playlist',
-        imageTag: pl.ImageTags?.Primary,
+        imageTag: pl.ImageTags?.Primary || null,
         next: { kind: 'playlist', title: pl.Name, playlistId: pl.Id },
       }));
     }
@@ -197,7 +209,7 @@ async function jfFetchRows(frame) {
       const data = await jfGet(`/Items?AlbumArtistIds=${frame.artistId}&IncludeItemTypes=MusicAlbum&Recursive=true&SortBy=PremiereDate,ProductionYear,SortName&SortOrder=Descending&Limit=500&UserId=${uid}`);
       return (data?.Items || []).map(al => ({
         id: al.Id, name: al.Name, subtitle: al.ProductionYear ? String(al.ProductionYear) : 'Album',
-        imageTag: al.ImageTags?.Primary,
+        imageTag: al.ImageTags?.Primary || null,
         next: { kind: 'album', title: al.Name, albumId: al.Id },
       }));
     }
@@ -208,7 +220,7 @@ async function jfFetchRows(frame) {
       return items.map((t, i) => ({
         id: t.Id, name: t.Name, track: true, trackIds, trackIndex: i,
         subtitle: (t.Artists && t.Artists.join(', ')) || t.AlbumArtist || '',
-        imageTag: t.ImageTags?.Primary,
+        imageTag: t.ImageTags?.Primary || null,
         albumId: t.AlbumId || null,
       }));
     }
@@ -219,7 +231,7 @@ async function jfFetchRows(frame) {
       return items.map((t, i) => ({
         id: t.Id, name: t.Name, track: true, trackIds, trackIndex: i,
         subtitle: (t.Artists && t.Artists.join(', ')) || '',
-        imageTag: t.ImageTags?.Primary,
+        imageTag: t.ImageTags?.Primary || null,
         albumId: t.AlbumId || null,
       }));
     }
@@ -341,7 +353,7 @@ async function jfArtistTracks(artistId) {
       out.push({
         id: t.Id, name: t.Name,
         subtitle: (t.Artists && t.Artists.join(', ')) || t.AlbumArtist || '',
-        imageTag: t.ImageTags?.Primary,
+        imageTag: t.ImageTags?.Primary || null,
         albumId: t.AlbumId || al.Id || null,
       });
     }
@@ -620,26 +632,57 @@ const cardStyles = `
   .smc-browse-chevron { color: ${THEME.chevron}; font-size: 14px; flex-shrink: 0; }
   .smc-loading { text-align: center; padding: 40px 0; color: ${THEME.muted}; font-size: 13px; }
 
-  /* ── Mini-player ── */
-  .smc-mini-player {
-    background: ${THEME.miniPlayerBg}; border-top: 2px solid ${THEME.primary};
-    display: flex; align-items: center; gap: 10px;
-    padding: 8px 12px; cursor: pointer; -webkit-tap-highlight-color: transparent;
+  /* ── Bottom bar (always visible — replaces the mini-player) ── */
+  .smc-bottom-bar {
+    background: #161616; border-top: 1px solid #222;
+    padding: 10px 12px; flex-shrink: 0;
+    cursor: pointer; -webkit-tap-highlight-color: transparent;
   }
-  .smc-mini-art {
-    width: 36px; height: 36px; border-radius: 6px;
-    object-fit: cover; background: ${THEME.surface}; flex-shrink: 0;
+  .smc-bb-main { display: flex; align-items: center; gap: 10px; }
+  .smc-bb-art {
+    width: 40px; height: 40px; border-radius: 6px;
+    object-fit: cover; background: #2a2a2a; flex-shrink: 0;
   }
-  .smc-mini-art-placeholder { width: 36px; height: 36px; border-radius: 6px; background: ${THEME.surface}; flex-shrink: 0; }
-  .smc-mini-info { flex: 1; min-width: 0; }
-  .smc-mini-title { font-size: 12px; color: ${THEME.text}; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .smc-mini-artist { font-size: 10px; color: ${THEME.statusMuted}; margin: 1px 0 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .smc-mini-btn {
-    background: none; border: none; color: ${THEME.text};
-    cursor: pointer; padding: 6px; display: flex; align-items: center;
-    -webkit-tap-highlight-color: transparent;
+  .smc-bb-art-placeholder {
+    width: 40px; height: 40px; border-radius: 6px; background: #2a2a2a;
+    flex-shrink: 0; display: flex; align-items: center; justify-content: center;
+    color: #555;
   }
-  .smc-mini-btn:active { opacity: 0.7; }
+  .smc-bb-info { flex: 1; min-width: 0; }
+  .smc-bb-title { font-size: 12px; color: #e5e5e5; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .smc-bb-artist { font-size: 10px; color: #525252; margin: 1px 0 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .smc-bb-btn {
+    background: none; border: none; color: #666; padding: 6px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; flex-shrink: 0; -webkit-tap-highlight-color: transparent;
+  }
+  .smc-bb-btn svg { width: 16px; height: 16px; }
+  .smc-bb-btn:active { opacity: 0.7; }
+  .smc-bb-play {
+    width: 34px; height: 34px; border-radius: 50%;
+    background: ${THEME.primary}; border: none; color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; flex-shrink: 0; -webkit-tap-highlight-color: transparent;
+  }
+  .smc-bb-play:active { opacity: 0.85; }
+  .smc-bb-play:disabled { opacity: 0.5; cursor: default; }
+  .smc-bb-progress { margin-top: 8px; }
+  .smc-bb-progress-bar {
+    width: 100%; height: 2px; background: #222; border-radius: 2px;
+    position: relative;
+  }
+  .smc-bb-progress-fill {
+    height: 100%; background: ${THEME.primary}; border-radius: 2px;
+    position: relative; transition: width 0.3s linear;
+  }
+  .smc-bb-progress-dot {
+    position: absolute; right: -4px; top: -3px;
+    width: 8px; height: 8px; border-radius: 50%; background: ${THEME.primary};
+  }
+  .smc-bb-progress-times {
+    display: flex; justify-content: space-between;
+    font-size: 9px; color: #444; margin-top: 3px;
+  }
 
   /* ── Now Playing ── */
   .np-scroll {
@@ -686,6 +729,11 @@ const cardStyles = `
   .np-transport {
     display: flex; align-items: center; justify-content: center;
     gap: 24px; padding: 16px 0;
+  }
+  /* Shuffle / repeat modes (play/prev/next live in the BottomBar) */
+  .np-modes {
+    display: flex; align-items: center; justify-content: center;
+    gap: 40px; padding: 14px 0 6px;
   }
   .np-transport-btn {
     background: none; border: none; color: ${THEME.muted}; cursor: pointer;
@@ -859,7 +907,7 @@ const cardStyles = `
     -webkit-tap-highlight-color: transparent;
   }
   .smc-chip:active { opacity: 0.8; }
-  .smc-spk-chip { background: #1c1c1c; border: 1px solid #2e2e2e; color: #666; }
+  .smc-spk-chip { background: #1c1c1c; border: 1px solid #333; color: #555; }
   .smc-spk-chip.selected { background: #0f1f3d; border-color: #3b82f6; color: #93c5fd; }
   .smc-chip-dot { width: 6px; height: 6px; border-radius: 50%; background: ${THEME.primary}; flex-shrink: 0; }
 
@@ -1070,6 +1118,40 @@ function formatTime(s) {
   return `${m}:${sec < 10 ? '0' : ''}${sec}`;
 }
 
+// ── Shared transport ────────────────────────────────────────────
+// Play/pause + next/prev, used by BOTH the BottomBar and NowPlayingView so the
+// two stay in lockstep. YTM tracks are not a native Sonos queue, so HA
+// media_next_track / media_previous_track no-op for them — next/prev resolve the
+// adjacent _ytmQueue track card-side and play_media it directly. Jellyfin/native
+// playback uses the HA transport services.
+function transportPlayPause(hass, entityId) {
+  if (!hass || !entityId) return;
+  hass.callService('media_player', 'media_play_pause', { entity_id: entityId });
+}
+async function ytmAdjacent(hass, entityId, delta) {
+  const i = _ytmQueue.findIndex(t => t.videoId === _ytmNowPlaying?.videoId);
+  const track = _ytmQueue[i + delta];
+  if (!track) return;
+  const url = `${_ytmServiceUrl}/audio/${encodeURIComponent(track.videoId)}.m4a`;
+  _ytmNowPlaying = { videoId: track.videoId, title: track.title, artist: track.artist, thumbnail: track.thumbnail };
+  _ytmDirty = true;
+  try {
+    await hass.callService('media_player', 'play_media', {
+      entity_id: entityId, media_content_id: url, media_content_type: 'music',
+    });
+  } catch (err) { console.error('[smc] YTM transport failed:', err); }
+}
+async function transportNext(hass, entityId) {
+  if (!hass || !entityId) return;
+  if (_smcService === 'ytm' && _ytmQueue.length > 0) return ytmAdjacent(hass, entityId, +1);
+  hass.callService('media_player', 'media_next_track', { entity_id: entityId });
+}
+async function transportPrev(hass, entityId) {
+  if (!hass || !entityId) return;
+  if (_smcService === 'ytm' && _ytmQueue.length > 0) return ytmAdjacent(hass, entityId, -1);
+  hass.callService('media_player', 'media_previous_track', { entity_id: entityId });
+}
+
 // ── Play + Queue buttons (every track row) ──────────────────────
 // Two circular buttons shown on the right of a track row. Play starts the track
 // immediately; + enqueues it without interrupting playback. `loading` swaps the
@@ -1108,10 +1190,11 @@ function SpeakerBar({ hass, selected, onSelect }) {
               const name = state?.attributes?.friendly_name || id.replace('media_player.', '');
               const sel = selected.includes(id);
               const playing = state?.state === 'playing';
+              // Dot only when the chip is BOTH selected and playing.
               return html`
                 <button key=${id} class=${`smc-chip smc-spk-chip${sel ? ' selected' : ''}`}
                   onClick=${() => onSelect(id)}>
-                  ${playing && html`<span class="smc-chip-dot"></span>`}${name}
+                  ${sel && playing && html`<span class="smc-chip-dot"></span>`}${name}
                 </button>
               `;
             })}
@@ -1877,9 +1960,6 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
 
   const np = useMemo(() => getNowPlaying(hass, selectedSpeakers, service), [hass, selectedSpeakers, service]);
 
-  // Use the entity that is actually playing (from np.entityId) rather than
-  // selectedSpeakers[0], which may be null if _smcSpeakers wasn't yet synced.
-  const entityId = np?.entityId || selectedSpeakers[0] || null;
   const [currentPos, setCurrentPos] = useState(0);
 
   // Real-time progress update
@@ -1904,51 +1984,6 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
     if (!h || !eid) return;
     h.callService('media_player', service, { entity_id: eid, ...data });
   }, [np, selectedSpeakers]);
-
-  const handlePlayPause = useCallback(() => callService('media_play_pause', {}), [callService]);
-
-  // YTM tracks are not a native Sonos queue, so HA media_next_track /
-  // media_previous_track do nothing for YTM playback. Handle next/prev card-side
-  // by resolving the adjacent track in _ytmQueue and playing it directly.
-  const handleNext = useCallback(async () => {
-    if (_smcService === 'ytm' && _ytmQueue.length > 0) {
-      const currentIdx = _ytmQueue.findIndex(t => t.videoId === _ytmNowPlaying?.videoId);
-      const nextTrack = _ytmQueue[currentIdx + 1];
-      if (!nextTrack) return;
-      const url = `${_ytmServiceUrl}/audio/${encodeURIComponent(nextTrack.videoId)}.m4a`;
-      _ytmNowPlaying = { videoId: nextTrack.videoId, title: nextTrack.title, artist: nextTrack.artist, thumbnail: nextTrack.thumbnail };
-      _ytmDirty = true;
-      try {
-        await hassRef.current.callService('media_player', 'play_media', {
-          entity_id: entityId,
-          media_content_id: url,
-          media_content_type: 'music',
-        });
-      } catch (err) { console.error('[smc] YTM next failed:', err); }
-      return;
-    }
-    callService('media_next_track', {});
-  }, [callService, entityId]);
-
-  const handlePrev = useCallback(async () => {
-    if (_smcService === 'ytm' && _ytmQueue.length > 0) {
-      const currentIdx = _ytmQueue.findIndex(t => t.videoId === _ytmNowPlaying?.videoId);
-      const prevTrack = _ytmQueue[currentIdx - 1];
-      if (!prevTrack) return;
-      const url = `${_ytmServiceUrl}/audio/${encodeURIComponent(prevTrack.videoId)}.m4a`;
-      _ytmNowPlaying = { videoId: prevTrack.videoId, title: prevTrack.title, artist: prevTrack.artist, thumbnail: prevTrack.thumbnail };
-      _ytmDirty = true;
-      try {
-        await hassRef.current.callService('media_player', 'play_media', {
-          entity_id: entityId,
-          media_content_id: url,
-          media_content_type: 'music',
-        });
-      } catch (err) { console.error('[smc] YTM prev failed:', err); }
-      return;
-    }
-    callService('media_previous_track', {});
-  }, [callService, entityId]);
 
   const handleShuffle = useCallback(() => {
     if (!np) return;
@@ -2051,21 +2086,16 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
         </div>
       </div>
 
-      <!-- Transport controls -->
+      <!-- Shuffle / repeat (transport play/prev/next live in the BottomBar) -->
       ${np.isExternal ? html`
         <p style="text-align:center; color:${THEME.muted}; font-size:12px; padding:12px 20px;">
-          Playing via ${np.source || 'external source'} — transport controls unavailable
+          Playing via ${np.source || 'external source'} — controls unavailable
         </p>
       ` : html`
-      <div class="np-transport">
+      <div class="np-modes">
         <button class=${`np-transport-btn${np.shuffle ? ' active' : ''}`} onClick=${(e) => { e.stopPropagation(); handleShuffle(); }}>
           <${IconShuffle} />
         </button>
-        <button class="np-transport-btn" onClick=${(e) => { e.stopPropagation(); handlePrev(); }}><${IconPrev} /></button>
-        <button class="np-play-btn" onClick=${(e) => { e.stopPropagation(); handlePlayPause(); }}>
-          ${np.isPlaying ? html`<${IconPause} size=${22} />` : html`<${IconPlay} size=${22} />`}
-        </button>
-        <button class="np-transport-btn" onClick=${(e) => { e.stopPropagation(); handleNext(); }}><${IconNext} /></button>
         <button class=${`np-transport-btn${np.repeat !== 'off' ? ' active' : ''}`}
           onClick=${(e) => { e.stopPropagation(); handleRepeat(); }} style="position:relative">
           <${IconRepeat} />
@@ -2092,31 +2122,71 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
   `;
 }
 
-// ── Mini Player ─────────────────────────────────────────────────
-function MiniPlayer({ nowPlaying, hass, onTap }) {
-  if (!nowPlaying) return null;
-  const handlePlayPause = useCallback((e) => {
-    e.stopPropagation();
-    if (!hass || !nowPlaying.entityId) return;
-    hass.callService('media_player', 'media_play_pause', { entity_id: nowPlaying.entityId });
-  }, [hass, nowPlaying]);
+// ── Bottom Bar (always visible — replaces the MiniPlayer) ────────
+// Persistent transport at the bottom of the card, visible on every tab. Row 1:
+// 40x40 art · title/artist · prev · play/pause circle · next. Row 2: a slim
+// progress bar with timestamps. Tapping the bar (anywhere but the buttons)
+// navigates to the Now Playing tab (the expanded view). Transport uses the shared
+// transport* helpers, so YTM next/prev resolve the adjacent _ytmQueue track
+// card-side exactly like NowPlayingView. With nothing playing it shows placeholder
+// art, "Nothing playing", and a disabled play button.
+function BottomBar({ nowPlaying, hass, onTap }) {
+  const np = nowPlaying;
+  const hasTrack = !!np;
+  const entityId = np?.entityId || null;
+  const [currentPos, setCurrentPos] = useState(0);
+
+  // Real-time progress (mirrors NowPlayingView's clock).
+  useEffect(() => {
+    if (!np) { setCurrentPos(0); return; }
+    const calcPos = () => {
+      if (!np.positionUpdatedAt || !np.isPlaying) return np.position;
+      const elapsed = (Date.now() - new Date(np.positionUpdatedAt).getTime()) / 1000;
+      return Math.min(np.position + elapsed, np.duration || Infinity);
+    };
+    setCurrentPos(calcPos());
+    if (!np.isPlaying) return;
+    const interval = setInterval(() => setCurrentPos(calcPos()), 1000);
+    return () => clearInterval(interval);
+  }, [np?.position, np?.positionUpdatedAt, np?.isPlaying, np?.duration]);
+
+  const progress = np?.duration > 0 ? Math.min(currentPos / np.duration, 1) : 0;
+
+  const onPrev = (e) => { e.stopPropagation(); if (hasTrack) transportPrev(hass, entityId); };
+  const onNext = (e) => { e.stopPropagation(); if (hasTrack) transportNext(hass, entityId); };
+  const onPlayPause = (e) => { e.stopPropagation(); if (hasTrack) transportPlayPause(hass, entityId); };
 
   return html`
-    <div class="smc-mini-player" onClick=${onTap}>
-      ${nowPlaying.art
-        ? html`<img class="smc-mini-art" src=${nowPlaying.art} alt="" loading="eager" />`
-        : html`<div class="smc-mini-art-placeholder" />`
-      }
-      <div class="smc-mini-info">
-        <p class="smc-mini-title">${nowPlaying.title}</p>
-        ${nowPlaying.artist && html`<p class="smc-mini-artist">${nowPlaying.artist}</p>`}
+    <div class="smc-bottom-bar" onClick=${onTap}>
+      <div class="smc-bb-main">
+        ${np?.art
+          ? html`<img class="smc-bb-art" src=${np.art} alt="" loading="eager"
+              referrerpolicy="no-referrer" onError=${(e) => { e.target.style.display = 'none'; }} />`
+          : html`<div class="smc-bb-art-placeholder">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+            </div>`
+        }
+        <div class="smc-bb-info">
+          <p class="smc-bb-title">${hasTrack ? np.title : 'Nothing playing'}</p>
+          ${hasTrack && np.artist && html`<p class="smc-bb-artist">${np.artist}</p>`}
+        </div>
+        <button class="smc-bb-btn" onClick=${onPrev}><${IconPrev} /></button>
+        <button class="smc-bb-play" disabled=${!hasTrack} onClick=${onPlayPause}>
+          ${np?.isPlaying ? html`<${IconPause} size=${16} />` : html`<${IconPlay} size=${16} />`}
+        </button>
+        <button class="smc-bb-btn" onClick=${onNext}><${IconNext} /></button>
       </div>
-      ${nowPlaying.isExternal
-        ? html`<span style="font-size:9px; color:${THEME.muted}; padding:4px 8px; border:1px solid ${THEME.border}; border-radius:4px;">${nowPlaying.source || 'EXT'}</span>`
-        : html`<button class="smc-mini-btn" onClick=${handlePlayPause}>
-            ${nowPlaying.isPlaying ? html`<${IconPause} />` : html`<${IconPlay} />`}
-          </button>`
-      }
+      <div class="smc-bb-progress">
+        <div class="smc-bb-progress-bar">
+          <div class="smc-bb-progress-fill" style=${`width: ${progress * 100}%`}>
+            <div class="smc-bb-progress-dot"></div>
+          </div>
+        </div>
+        <div class="smc-bb-progress-times">
+          <span>${formatTime(currentPos)}</span>
+          <span>${formatTime(np?.duration || 0)}</span>
+        </div>
+      </div>
     </div>
   `;
 }
@@ -2241,42 +2311,37 @@ function smcAutoDetect(hass) {
   }
 }
 
-// Chip toggle — the chips ARE the group (Model A). Tap an unselected chip to add
-// it: it joins the whole selection under the primary (first selected) coordinator
-// and resumes playback if anything was playing. Tap a selected chip to remove it:
-// it unjoins (and so stops). _smcSpeakers updates synchronously (before any await)
-// so the UI can re-render optimistically; HA state reconciles afterward.
+// Chip toggle — clean on/off (no unjoin-all + rejoin dance). Tap an OFF chip to
+// join it to the currently active group: if something is playing, join the new
+// member to the coordinator (first selected speaker); if nothing is playing, just
+// add it to the selection (it becomes the target for the next play). Tap an ON
+// chip to unjoin it (it stops) and drop it from the selection — but the last
+// remaining speaker can never be deselected. _smcSpeakers mutates synchronously
+// (before any await) so the UI re-renders optimistically; HA reconciles after.
 async function smcToggleSpeaker(entityId, hass) {
   const isSelected = _smcSpeakers.includes(entityId);
 
-  // Never deselect the last speaker — leaves the card with nothing to target.
-  if (isSelected && _smcSpeakers.length <= 1) return;
-
   if (isSelected) {
-    // Remove: unjoin this speaker (stops it), remove from selection.
+    // Cannot remove last speaker
+    if (_smcSpeakers.length <= 1) return;
+    // Unjoin — stops playback on this speaker
     _smcSpeakers = _smcSpeakers.filter(id => id !== entityId);
-    if (hass) await hass.callService('media_player', 'unjoin', { entity_id: entityId });
+    try {
+      await hass.callService('media_player', 'unjoin', { entity_id: entityId });
+    } catch (err) { console.error('[smc] unjoin failed:', err); }
   } else {
-    // Add: add to selection, then rejoin the whole group with primary as coordinator.
+    // Add to selection
     _smcSpeakers = [..._smcSpeakers, entityId];
-    if (hass && _smcSpeakers.length >= 2) {
-      const primary = _smcSpeakers[0];
-      // Unjoin all first, then rejoin — reuse the 500ms/1000ms timing from the
-      // old handleGroup.
-      await Promise.all(_smcSpeakers.map(id =>
-        hass.callService('media_player', 'unjoin', { entity_id: id })
-      ));
-      await new Promise(r => setTimeout(r, 500));
-      await hass.callService('media_player', 'join', {
-        entity_id: primary,
-        group_members: _smcSpeakers,
-      });
-      // Resume playback on the coordinator if something was playing.
-      const wasPlaying = _smcSpeakers.some(id => hass.states[id]?.state === 'playing');
-      if (wasPlaying) {
-        await new Promise(r => setTimeout(r, 1000));
-        await hass.callService('media_player', 'media_play', { entity_id: primary });
-      }
+    // If something is playing, join to the coordinator (first selected speaker)
+    const coordinator = _smcSpeakers[0];
+    const somethingPlaying = _smcSpeakers.some(id => hass.states[id]?.state === 'playing');
+    if (somethingPlaying && coordinator) {
+      try {
+        await hass.callService('media_player', 'join', {
+          entity_id: coordinator,
+          group_members: _smcSpeakers,
+        });
+      } catch (err) { console.error('[smc] join failed:', err); }
     }
   }
 
@@ -2386,9 +2451,7 @@ function SonosMusicApp({ hass, config }) {
         <${NowPlayingView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} service=${service} />
       </div>
 
-      ${activeTab !== 'playing' && html`
-        <${MiniPlayer} nowPlaying=${nowPlaying} hass=${hass} onTap=${() => setActiveTab('playing')} />
-      `}
+      <${BottomBar} nowPlaying=${nowPlaying} hass=${hass} onTap=${() => setActiveTab('playing')} />
       ${toast && html`<div class="smc-toast">${toast}</div>`}
     </div>
   `;
