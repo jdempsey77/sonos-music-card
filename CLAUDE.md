@@ -235,6 +235,14 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.17.4** — Jellyfin now-playing art for **auto-detected tracks** (a track
+already playing when the card loads, not launched from the card, so
+`_smcNowPlayingJfId` is null and `jfNowPlayingArt()` returns nothing). The
+Jellyfin branch of `buildNpInfo` now falls back to extracting the item ID from
+`media_content_id` — which carries the Jellyfin stream URL `/Audio/{itemId}/stream`
+— via regex, and builds the `/Items/{id}/Images/Primary` art URL directly. Covers
+the common case of opening the card while music is already playing.
+
 **v0.17.3** — Jellyfin now-playing art falls back to **album art** when a track
 has no `Primary` image (some Jellyfin items only carry album-level art, so the
 track-level `/Items/{trackId}/Images/Primary` URL 404'd and Now Playing showed a
@@ -387,6 +395,7 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [x] YTM next/prev (card-side, HA next/prev no-op for non-native queue) — v0.17.2
 - [x] Jellyfin now-playing art 404 (prefer `jfNowPlayingArt()` over HA proxy) — v0.17.2
 - [x] Jellyfin now-playing art album fallback (track has no Primary image) — v0.17.3
+- [x] Jellyfin art for auto-detected tracks (extract item ID from media_content_id) — v0.17.4
 - [x] localStorage tracking-prevention console spam — v0.17.2 (safe storage wrapper)
 
 ## Session startup checklist
