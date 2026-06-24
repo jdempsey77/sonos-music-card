@@ -160,7 +160,7 @@ let _smcDirty = false        // signals Preact to re-render after auto-detect ch
 | `smcInit(hass)` | Cold load. Seeds `_smcSpeakers` from playing state or localStorage |
 | `smcAutoDetect(hass)` | Every hass update. Promotes a playing speaker if nothing selected |
 | `smcToggleSpeaker(entityId, hass)` | Chip toggle = group membership (clean on/off, v0.19.0). Add → simple `join` to the active coordinator if something's playing, else just select; remove → `unjoin` (stops). Last speaker can't be removed. Async; `_smcSpeakers` mutates synchronously for optimistic UI. Sets `_smcUserSelected = true` |
-| `transportPlayPause/Next/Prev(hass, entityId)` | Shared transport (v0.19.0) used by both BottomBar and NowPlayingView. Native/Jellyfin → HA `media_*` services; YTM → resolve adjacent `_ytmQueue` track card-side |
+| `transportPlayPause/Next/Prev(hass, entityId)` | Shared transport (v0.19.0) used by both BottomBar and NowPlayingView. Play/pause → HA `media_play_pause`. Next/prev resolve the adjacent queue track card-side and `play_media` it when the active service has a card-side queue — YTM via `ytmAdjacent`/`_ytmQueue`, Jellyfin via `jfAdjacent`/`_smcQueue` (v0.19.1; HA `media_next_track` no-ops on native Sonos entities queued via `play_media`). Falls back to HA `media_*` services when the queue is empty |
 | `hasMediaContext(state)` | True if playing, paused, or idle+title+mid-track |
 | `isExternalSource(state)` | True if playing from a non-queue source (TV, line-in) |
 | `getNowPlaying(hass, selected, service)` | Now-playing scoped to the active service (`_smcService`): YTM context = stored `_ytmNowPlaying`; Jellyfin context = live HA state. No cross-read |
@@ -258,6 +258,8 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.19.1** — Jellyfin next/prev card-side queue navigation (`jfAdjacent` mirrors `ytmAdjacent`).
+
 **v0.19.0** — Persistent bottom bar, speaker chip overhaul, album thumbnail fix.
 1. **`BottomBar` replaces `MiniPlayer`** — always mounted regardless of active tab
    (the old MiniPlayer was hidden on Now Playing). Row 1: 40x40 art · title/artist ·

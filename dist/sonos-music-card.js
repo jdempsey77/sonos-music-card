@@ -1,4 +1,4 @@
-// Sonos Music Card v0.19.0
+// Sonos Music Card v0.19.1
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -1141,14 +1141,30 @@ async function ytmAdjacent(hass, entityId, delta) {
     });
   } catch (err) { console.error('[smc] YTM transport failed:', err); }
 }
+async function jfAdjacent(hass, entityId, delta) {
+  const i = _smcQueue.findIndex(t => t.id === _smcNowPlayingJfId);
+  const track = _smcQueue[i + delta];
+  if (!track) return;
+  try {
+    await hass.callService('media_player', 'play_media', {
+      entity_id: entityId,
+      media_content_id: jfStreamUrl(track.id),
+      media_content_type: 'music',
+    });
+    _smcNowPlayingJfId = track.id;
+    _smcNowPlayingJfAlbumId = track.albumId || null;
+  } catch (err) { console.error('[smc] JF transport failed:', err); }
+}
 async function transportNext(hass, entityId) {
   if (!hass || !entityId) return;
   if (_smcService === 'ytm' && _ytmQueue.length > 0) return ytmAdjacent(hass, entityId, +1);
+  if (_smcService === 'jf' && _smcQueue.length > 0) return jfAdjacent(hass, entityId, +1);
   hass.callService('media_player', 'media_next_track', { entity_id: entityId });
 }
 async function transportPrev(hass, entityId) {
   if (!hass || !entityId) return;
   if (_smcService === 'ytm' && _ytmQueue.length > 0) return ytmAdjacent(hass, entityId, -1);
+  if (_smcService === 'jf' && _smcQueue.length > 0) return jfAdjacent(hass, entityId, -1);
   hass.callService('media_player', 'media_previous_track', { entity_id: entityId });
 }
 
