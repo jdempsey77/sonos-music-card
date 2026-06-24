@@ -235,6 +235,45 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.18.0** — Targeted bug-fix pass (8 fixes, no architectural change):
+1. **Auto-detect latch (B1)** — `smcAutoDetect` ran on every ~1Hz hass push and
+   never recorded its own choice, so two simultaneously-playing speakers made it
+   oscillate every tick. It now latches after promoting a speaker
+   (`_smcUserSelected = true` + timestamp — the same 30s block a user tap engages)
+   and returns immediately if any selected speaker is `playing`.
+2. **Render-phase side effect removed (A2)** — the `_smcDirty` / `_ytmDirty`
+   checks (which called `setTimeout(forceUpdate)`) moved out of the `SonosMusicApp`
+   render body into a `useEffect` (no dep array). Scheduling a render from the
+   render body is structurally unsound.
+3. **`getNowPlaying` made pure (A1)** — it no longer clears `_smcNowPlayingJfId` /
+   `_smcNowPlayingJfAlbumId` on the idle path (it's called from three `useMemo`s).
+   The stale-art cleanup moved to a `SonosMusicApp` `useEffect` keyed on
+   `nowPlaying` (guarded to the Jellyfin service so switching to YTM doesn't wipe a
+   still-valid Jellyfin art id).
+4. **YTM title from `media_content_id` (B2)** — after a reload `_smcService` resets
+   to `jf` and `_ytmNowPlaying` is null, so a playing YTM track showed its raw
+   stream URL / "Unknown". `buildNpInfo` now detects a bad title (URL / "Unknown")
+   and substitutes `_ytmNowPlaying` or a generic "YouTube Music" placeholder when
+   the `media_content_id` is a `/audio/<id>.m4a` stream. YTM art now prefers the
+   stored thumbnail over a (404ing) `entity_picture`.
+5. **Art pipeline reordered (B4)** — `info.art` seeds **null**; the Jellyfin branch
+   builds it in explicit priority: known JF id → extract from stream URL → album
+   fallback → HA proxy (last). A non-null-but-404ing `entity_picture` no longer
+   short-circuits the better sources. Stream-URL regex widened to `[a-f0-9-]+`
+   (dashed GUIDs).
+6. **Last-speaker guard (A4)** — `smcToggleSpeaker` won't deselect the only
+   remaining speaker.
+7. **Volume sliders fall back to selected speakers (A8)** — `volumeSpeakers` uses
+   the playing group's members when grouped, else the selected speakers.
+8. **Volume slider debounced (A10)** — `volume_set` now fires 300ms after the last
+   drag event (module-level `_volumeDebounceTimer`) instead of on every onInput,
+   so dragging no longer floods HA.
+
+Known limitation: the queue + YTM now-playing do **not** persist across a card
+reload — `localStorage` is blocked by Edge/Chromium tracking prevention in this
+HA environment (see the safe storage wrapper, v0.17.2), so both are in-memory by
+design. Intentionally not implemented, not a bug.
+
 **v0.17.4** — Jellyfin now-playing art for **auto-detected tracks** (a track
 already playing when the card loads, not launched from the card, so
 `_smcNowPlayingJfId` is null and `jfNowPlayingArt()` returns nothing). The
@@ -397,6 +436,14 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [x] Jellyfin now-playing art album fallback (track has no Primary image) — v0.17.3
 - [x] Jellyfin art for auto-detected tracks (extract item ID from media_content_id) — v0.17.4
 - [x] localStorage tracking-prevention console spam — v0.17.2 (safe storage wrapper)
+- [x] Auto-detect oscillation between two playing speakers (latch) — v0.18.0
+- [x] Render-phase side effects / impure `getNowPlaying` (moved to effects) — v0.18.0
+- [x] YTM title/art lost after reload (recover from `media_content_id`) — v0.18.0
+- [x] Volume slider flooding HA (300ms debounce) — v0.18.0
+- [~] Queue + YTM now-playing persistence across reload — **intentionally not
+  implemented**: `localStorage` is blocked by Edge/Chromium tracking prevention in
+  this HA/Edge environment, so card-side queue + `_ytmNowPlaying` are in-memory by
+  design (see the v0.17.2 safe storage wrapper). Not a bug.
 
 ## Session startup checklist
 1. Read this file (`cat ~/code/sonos-music-card/CLAUDE.md`)

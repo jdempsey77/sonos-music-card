@@ -1,4 +1,4 @@
-// Sonos Music Card v0.17.4
+// Sonos Music Card v0.18.0
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -26,6 +26,13 @@
 // _smcNowPlayingJfAlbumId module state mirrors _smcNowPlayingJfId. jfNowPlayingArt()
 // uses album art when track art is absent, and the NP <img> onError swaps to album
 // art if the track-level URL 404s at render time.
+// v0.18.0: targeted bug-fix pass. Auto-detect latches after promoting a speaker
+// (stops two simultaneously-playing speakers oscillating); module dirty-flag sync
+// and JF-id clearing moved out of the render body / getNowPlaying into useEffects
+// (no render-phase side effects); YTM title/art recovered from media_content_id
+// after a reload resets _smcService; art pipeline reordered so a 404ing HA proxy
+// is last resort (regex handles dashed GUIDs); last-speaker deselect guarded;
+// volume sliders fall back to the selected speakers; volume_set debounced 300ms.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -917,7 +924,7 @@ function buildNpInfo(id, state, service = _smcService) {
     title: a.media_title || 'Unknown',
     artist: a.media_artist || '',
     album: a.media_album_name || '',
-    art: jfNowPlayingArt() || smcResolveImage(a.entity_picture),
+    art: null,   // seeded null; built in priority order below (B4)
     isPlaying: state.state === 'playing',
     isExternal: isExternalSource(state),
     source: a.source || null,
@@ -930,21 +937,49 @@ function buildNpInfo(id, state, service = _smcService) {
 
   if (service === 'ytm') {
     // YTM active: title/artist/art come from stored YTM metadata (HA reports the
-    // raw stream URL as media_title). Never read Jellyfin art.
+    // raw stream URL as media_title). Never read Jellyfin art. The thumbnail wins
+    // over any HA entity_picture (which 404s for native Sonos entities).
     info.title = _ytmNowPlaying?.title || info.title;
     info.artist = _ytmNowPlaying?.artist || info.artist;
-    info.art = info.art || _ytmNowPlaying?.thumbnail || null;
+    info.art = _ytmNowPlaying?.thumbnail || info.art || null;
   } else {
-    // Jellyfin active: source cover art from Jellyfin when HA gives us none.
-    // Never read YTM metadata.
-    // If _smcNowPlayingJfId is null (auto-detected track, not played from
-    // the card), extract the item ID from media_content_id which contains
-    // the Jellyfin stream URL: /Audio/{itemId}/stream.mp3
+    // Jellyfin active: build cover art in explicit priority order. A non-null but
+    // 404ing HA entity_picture must NOT short-circuit the better sources, so the
+    // HA proxy is the LAST resort.
+    // Priority: known JF id → extract from stream URL → album fallback → HA proxy
+    if (!info.art && _smcNowPlayingJfId) {
+      info.art = jfNowPlayingArt();
+    }
     if (!info.art && a.media_content_id) {
-      const m = a.media_content_id.match(/\/Audio\/([a-f0-9]+)\/stream/i);
+      // Auto-detected track (not played from the card): extract the item ID from
+      // media_content_id, which carries the Jellyfin stream URL /Audio/{id}/stream.
+      // [a-f0-9-]+ handles both dashless and dashed GUIDs.
+      const m = a.media_content_id.match(/\/Audio\/([a-f0-9-]+)\/stream/i);
       if (m && _jellyfinUrl && _jellyfinToken) {
         info.art = `${_jellyfinUrl}/Items/${m[1]}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
       }
+    }
+    if (!info.art && _smcNowPlayingJfAlbumId && _jellyfinUrl && _jellyfinToken) {
+      info.art = `${_jellyfinUrl}/Items/${_smcNowPlayingJfAlbumId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
+    }
+    if (!info.art) {
+      info.art = smcResolveImage(a.entity_picture);
+    }
+  }
+
+  // YTM-from-URL fallback: after a card reload _smcService resets to 'jf' and
+  // _ytmNowPlaying is null, so a still-playing YTM track surfaces its raw stream
+  // URL as the title. Detect that and substitute real metadata when we have it,
+  // else a generic placeholder so the UI never shows the bare URL or "Unknown".
+  if (info.title === 'Unknown' || info.title?.includes('videoplayback') || info.title?.startsWith('http')) {
+    if (_ytmNowPlaying) {
+      info.title = _ytmNowPlaying.title || info.title;
+      info.artist = _ytmNowPlaying.artist || info.artist;
+      info.art = info.art || _ytmNowPlaying.thumbnail || null;
+    } else if (a.media_content_id?.includes('/audio/') && a.media_content_id?.endsWith('.m4a')) {
+      // YTM stream (ytm-service /audio/<id>.m4a) but no stored metadata.
+      info.title = 'YouTube Music';
+      info.artist = '';
     }
   }
 
@@ -1022,12 +1057,9 @@ function getNowPlaying(hass, selectedSpeakers, service = _smcService) {
     const state = hass.states[id];
     if (state && hasMediaContext(state)) return buildNpInfo(id, state, 'jf');
   }
-  // Nothing playing/paused anywhere — player is idle, drop the stored Jellyfin
-  // art id (stale art after the queue ends is wrong). _ytmNowPlaying is NOT
-  // cleared here so the last-played YTM track stays visible if the user switches
-  // back to the YTM service; it's cleared only in playJfTracks()/enqueueJfTracks().
-  _smcNowPlayingJfId = null;
-  _smcNowPlayingJfAlbumId = null;
+  // Nothing playing/paused anywhere. getNowPlaying is PURE (called from three
+  // useMemos) — it does NOT clear the stored Jellyfin art ids here. That stale-art
+  // cleanup now lives in a SonosMusicApp useEffect keyed on the idle transition.
   return null;
 }
 
@@ -1832,6 +1864,12 @@ function QueueView({ hass, selectedSpeakers, onTabChange, service }) {
   `;
 }
 
+// Debounce timer for the volume sliders — dragging a slider fires onInput on
+// every pixel, which would flood HA with volume_set calls. Module-level so it
+// survives re-renders; coalesces rapid changes into one call 300ms after the
+// last drag event.
+let _volumeDebounceTimer = null;
+
 // ── Now Playing View ────────────────────────────────────────────
 function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
   const hassRef = useRef(hass);
@@ -1934,27 +1972,35 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
   const handleVolume = useCallback((speakerId, value) => {
     const h = hassRef.current;
     if (!h) return;
-    h.callService('media_player', 'volume_set', {
-      entity_id: speakerId,
-      volume_level: value / 100,
-    });
+    // Debounce: coalesce a drag's flood of onInput events into one volume_set
+    // 300ms after the last change.
+    if (_volumeDebounceTimer) clearTimeout(_volumeDebounceTimer);
+    _volumeDebounceTimer = setTimeout(() => {
+      h.callService('media_player', 'volume_set', {
+        entity_id: speakerId,
+        volume_level: value / 100,
+      });
+      _volumeDebounceTimer = null;
+    }, 300);
   }, []);
 
-  // Grouped speakers for volume — derive entityId inside memo
+  // Grouped speakers for volume. Prefer the playing group's members; when nothing
+  // is grouped (or np is null) fall back to the selected speakers so every
+  // selected speaker still gets a slider.
   const volumeSpeakers = useMemo(() => {
     const eid = np?.entityId || selectedSpeakers[0] || null;
-    if (!hass || !eid) return [];
-    const primary = hass.states[eid];
-    const members = primary?.attributes?.group_members?.length
-      ? primary.attributes.group_members : [eid];
-    return members.map(id => {
-      const s = hass.states[id];
+    const ids = eid && hass?.states[eid]?.attributes?.group_members?.length
+      ? hass.states[eid].attributes.group_members
+      : selectedSpeakers;
+    return ids.map(id => {
+      const s = hass?.states[id];
       return {
         id,
         name: s?.attributes?.friendly_name || id.replace('media_player.', ''),
-        volume: s?.attributes?.volume_level != null ? Math.round(s.attributes.volume_level * 100) : 50,
+        volume: s?.attributes?.volume_level != null
+          ? Math.round(s.attributes.volume_level * 100) : 50,
       };
-    });
+    }).filter(sp => sp.id);
   }, [hass, np, selectedSpeakers]);
 
   // Nothing playing state
@@ -2154,19 +2200,23 @@ function smcInit(hass) {
 function smcAutoDetect(hass) {
   const speakers = getSpeakers(hass);
 
+  // If any selected speaker is actively playing, never auto-switch. (Checked
+  // first so a playing selection short-circuits before the latch logic.)
+  const selPlaying = _smcSpeakers.some(id => hass.states[id]?.state === 'playing');
+  if (selPlaying) return;
+
+  // Respect the latch: after any user tap OR a prior auto-detect promotion,
+  // block re-evaluation for 30s, then release only if the selection has gone
+  // completely idle. This latch is what stops two simultaneously-playing speakers
+  // from oscillating — auto-detect fires ONCE, promotes a speaker, latches, and
+  // stays put instead of flipping to the other playing speaker on the next tick.
   if (_smcUserSelected) {
-    // Hard block for 30s after any user tap
     const age = Date.now() - _smcUserSelectedAt;
     if (age < 30000) return;
-    // After 30s, only release if selection is completely idle
     const selStillActive = _smcSpeakers.some(id => hasMediaContext(hass.states[id]));
     if (selStillActive) return;
     _smcUserSelected = false;
   }
-
-  // Is any selected speaker actively playing?
-  const selPlaying = _smcSpeakers.some(id => hass.states[id]?.state === 'playing');
-  if (selPlaying) return;
 
   // Find any configured speaker actively playing (not external source)
   let active = speakers.find(id => {
@@ -2183,6 +2233,10 @@ function smcAutoDetect(hass) {
     console.log('[smc] auto-detect: switching to', active);
     _smcSpeakers = [active];
     _smcDirty = true;
+    // Latch the promotion — the same 30s block a user tap engages — so a second
+    // simultaneously-playing speaker can't flip the selection on the next tick.
+    _smcUserSelected = true;
+    _smcUserSelectedAt = Date.now();
     storageSave(SMC_KEY, JSON.stringify(_smcSpeakers));
   }
 }
@@ -2194,6 +2248,9 @@ function smcAutoDetect(hass) {
 // so the UI can re-render optimistically; HA state reconciles afterward.
 async function smcToggleSpeaker(entityId, hass) {
   const isSelected = _smcSpeakers.includes(entityId);
+
+  // Never deselect the last speaker — leaves the card with nothing to target.
+  if (isSelected && _smcSpeakers.length <= 1) return;
 
   if (isSelected) {
     // Remove: unjoin this speaker (stops it), remove from selection.
@@ -2238,23 +2295,38 @@ function SonosMusicApp({ hass, config }) {
   // Force re-render counter — bumped when user taps a speaker
   const [, forceUpdate] = useState(0);
 
-  // Sync auto-detected speaker changes into Preact render cycle
-  if (_smcDirty) {
-    _smcDirty = false;
-    setTimeout(() => forceUpdate(n => n + 1), 0);
-  }
-
-  // Sync YTM now-playing changes (module-level, no hass update) into render cycle
-  if (_ytmDirty) {
-    _ytmDirty = false;
-    setTimeout(() => forceUpdate(n => n + 1), 0);
-  }
+  // Sync module-level dirty flags (auto-detect speaker change, YTM now-playing
+  // change) into the Preact render cycle. Runs after every render — checking the
+  // flags in the render body and scheduling a render there is a render-phase side
+  // effect, which is structurally unsound; doing it in an effect is the safe path.
+  useEffect(() => {
+    if (_smcDirty) {
+      _smcDirty = false;
+      forceUpdate(n => n + 1);
+    }
+    if (_ytmDirty) {
+      _ytmDirty = false;
+      forceUpdate(n => n + 1);
+    }
+  });
 
   // Read directly from module-level state — always current
   const selectedSpeakers = _smcSpeakers;
 
   // Derive now-playing directly from hass, scoped to the active service.
   const nowPlaying = useMemo(() => getNowPlaying(hass, selectedSpeakers, service), [hass, selectedSpeakers, service]);
+
+  // Stale-art cleanup, moved out of getNowPlaying (which is now pure). When the
+  // active Jellyfin context goes idle (nowPlaying becomes null), drop the stored
+  // Jellyfin art ids so stale art doesn't linger after the queue ends. Scoped to
+  // the Jellyfin service so switching to YTM (where nowPlaying is null until a YTM
+  // track plays) doesn't wipe a still-valid Jellyfin art id.
+  useEffect(() => {
+    if (service !== 'ytm' && !nowPlaying && _smcNowPlayingJfId) {
+      _smcNowPlayingJfId = null;
+      _smcNowPlayingJfAlbumId = null;
+    }
+  }, [nowPlaying, service]);
 
   // Chip tap → toggle membership (the chips ARE the group). _smcSpeakers mutates
   // synchronously inside smcToggleSpeaker, so the optimistic forceUpdate reflects
