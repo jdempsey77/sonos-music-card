@@ -1,4 +1,4 @@
-// Sonos Music Card v0.17.2
+// Sonos Music Card v0.17.3
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -21,6 +21,11 @@
 // gained an Add All button; YTM next/prev handled card-side via _ytmQueue (HA
 // media_next/previous_track no-op for non-native YTM queue); localStorage access
 // routed through a safe wrapper to silence tracking-prevention console spam.
+// v0.17.3: Jellyfin now-playing art falls back to album art when a track has no
+// Primary image. Track rows / queue items / toQueueItem now carry albumId; new
+// _smcNowPlayingJfAlbumId module state mirrors _smcNowPlayingJfId. jfNowPlayingArt()
+// uses album art when track art is absent, and the NP <img> onError swaps to album
+// art if the track-level URL 404s at render time.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -49,6 +54,7 @@ let _ytmServiceUrl = null;        // browser-facing base, e.g. https://ska.hq.st
 // reflect Jellyfin cover art back through HA (entity_picture is null), so we
 // use this to source the Now Playing art ourselves. Cleared when idle.
 let _smcNowPlayingJfId = null;
+let _smcNowPlayingJfAlbumId = null;
 
 // YTM now-playing metadata — set when a YTM track starts, cleared when Jellyfin
 // playback starts or the player goes idle. HA reports the raw stream URL as
@@ -125,8 +131,16 @@ function jfStreamUrl(itemId) {
 // Full-size cover art for the currently-playing Jellyfin track (public base —
 // browser-facing). Used as a fallback when HA gives us no entity_picture.
 function jfNowPlayingArt() {
-  if (!_smcNowPlayingJfId || !_jellyfinUrl) return null;
-  return `${_jellyfinUrl}/Items/${_smcNowPlayingJfId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
+  if (!_jellyfinUrl) return null;
+  // Prefer track-level art; fall back to album art if the track has no Primary
+  // image (an onError handler on the NP img swaps to album art if this 404s).
+  if (_smcNowPlayingJfId) {
+    return `${_jellyfinUrl}/Items/${_smcNowPlayingJfId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
+  }
+  if (_smcNowPlayingJfAlbumId) {
+    return `${_jellyfinUrl}/Items/${_smcNowPlayingJfAlbumId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
+  }
+  return null;
 }
 
 // Build normalized browse rows for a navigation frame.
@@ -188,6 +202,7 @@ async function jfFetchRows(frame) {
         id: t.Id, name: t.Name, track: true, trackIds, trackIndex: i,
         subtitle: (t.Artists && t.Artists.join(', ')) || t.AlbumArtist || '',
         imageTag: t.ImageTags?.Primary,
+        albumId: t.AlbumId || null,
       }));
     }
     case 'playlist': {
@@ -198,6 +213,7 @@ async function jfFetchRows(frame) {
         id: t.Id, name: t.Name, track: true, trackIds, trackIndex: i,
         subtitle: (t.Artists && t.Artists.join(', ')) || '',
         imageTag: t.ImageTags?.Primary,
+        albumId: t.AlbumId || null,
       }));
     }
     default:
@@ -219,7 +235,7 @@ async function jfSearch(term) {
 
 // Normalize a track to the card-side queue shape.
 function toQueueItem(t) {
-  return { id: t.id, name: t.name, subtitle: t.subtitle || '', imageTag: t.imageTag || null };
+  return { id: t.id, name: t.name, subtitle: t.subtitle || '', imageTag: t.imageTag || null, albumId: t.albumId || null };
 }
 
 // Play a list of Jellyfin tracks from startIndex via HA. `tracks` is an array of
@@ -242,6 +258,7 @@ async function playJfTracks(hass, eid, tracks, startIndex = 0) {
       media_content_type: 'music',
     });
     _smcNowPlayingJfId = ids[0];
+    _smcNowPlayingJfAlbumId = slice[0]?.albumId || null;
     _smcQueue = slice.map(toQueueItem);
     _smcQueueEntityId = eid;
   } catch (err) {
@@ -300,6 +317,7 @@ async function jumpToQueueTrack(hass, eid, track) {
       media_content_type: 'music',
     });
     _smcNowPlayingJfId = track.id;
+    _smcNowPlayingJfAlbumId = track.albumId || null;
   } catch (err) { console.error('[smc] jump failed:', err); }
 }
 
@@ -317,6 +335,7 @@ async function jfArtistTracks(artistId) {
         id: t.Id, name: t.Name,
         subtitle: (t.Artists && t.Artists.join(', ')) || t.AlbumArtist || '',
         imageTag: t.ImageTags?.Primary,
+        albumId: t.AlbumId || al.Id || null,
       });
     }
   }
@@ -371,6 +390,7 @@ async function playYtmTrack(hass, eid, videoId, meta = {}, queue = null) {
   _ytmQueue = (queue && queue.length) ? queue.map(toYtmQueueItem) : [toYtmQueueItem({ videoId, ...meta })];
   _ytmQueueEntityId = eid;
   _smcNowPlayingJfId = null;   // different source — drop Jellyfin art
+  _smcNowPlayingJfAlbumId = null;
   _smcQueue = [];              // different source — drop Jellyfin queue
   _smcQueueEntityId = null;
   try {
@@ -396,7 +416,7 @@ async function enqueueYtmTrack(hass, eid, track) {
   // Cross-clear the opposing service's state — enqueueing into YTM makes YTM the
   // active source (mirrors what playYtmTrack does on the play path).
   if (_smcService === 'ytm') {
-    _smcNowPlayingJfId = null; _smcQueue = []; _smcQueueEntityId = null;
+    _smcNowPlayingJfId = null; _smcNowPlayingJfAlbumId = null; _smcQueue = []; _smcQueueEntityId = null;
   }
   // Scope the card-side queue to this speaker (mirrors enqueueJfTracks).
   if (_ytmQueueEntityId !== eid) { _ytmQueue = []; _ytmQueueEntityId = eid; }
@@ -998,6 +1018,7 @@ function getNowPlaying(hass, selectedSpeakers, service = _smcService) {
   // cleared here so the last-played YTM track stays visible if the user switches
   // back to the YTM service; it's cleared only in playJfTracks()/enqueueJfTracks().
   _smcNowPlayingJfId = null;
+  _smcNowPlayingJfAlbumId = null;
   return null;
 }
 
@@ -1425,7 +1446,7 @@ function SearchView({ hass, selectedSpeakers, onTabChange, onToast }) {
           <p class="smc-section-label">Tracks</p>
           <div class="smc-browse-list">
             ${results.tracks.map(t => {
-              const meta = { id: t.Id, name: t.Name, subtitle: (t.Artists && t.Artists.join(', ')) || t.AlbumArtist || '', imageTag: t.ImageTags?.Primary };
+              const meta = { id: t.Id, name: t.Name, subtitle: (t.Artists && t.Artists.join(', ')) || t.AlbumArtist || '', imageTag: t.ImageTags?.Primary, albumId: t.AlbumId || null };
               return html`
                 <div key=${t.Id} class="smc-browse-row">
                   ${t.ImageTags?.Primary
@@ -1944,7 +1965,15 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
     <div class="np-scroll">
       <!-- Album art (centered square) -->
       ${np.art
-        ? html`<img class="np-art-square" src=${np.art} alt="" loading="eager" />`
+        ? html`<img class="np-art-square" src=${np.art} alt="" loading="eager"
+            onError=${(e) => {
+              // Track-level art 404'd — fall back to album art once, then hide.
+              if (_smcNowPlayingJfAlbumId && _jellyfinUrl && !e.target.src.includes(_smcNowPlayingJfAlbumId)) {
+                e.target.src = `${_jellyfinUrl}/Items/${_smcNowPlayingJfAlbumId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
+              } else {
+                e.target.style.display = 'none';
+              }
+            }} />`
         : html`<div class="np-art-square-placeholder"><${IconMusicNote} /></div>`
       }
 
