@@ -1,4 +1,4 @@
-// Sonos Music Card v0.19.2
+// Sonos Music Card v0.19.3
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -72,6 +72,10 @@ let _ytmServiceUrl = null;        // browser-facing base, e.g. https://ska.hq.st
 // use this to source the Now Playing art ourselves. Cleared when idle.
 let _smcNowPlayingJfId = null;
 let _smcNowPlayingJfAlbumId = null;
+// Last item id we kicked off a background imageTag fetch for (auto-detected
+// tracks after a reload, when _smcQueue is empty). Guards against repeated
+// fetches for the same item. Cleared alongside _smcNowPlayingJfId.
+let _smcLastFetchedArtId = null;
 
 // YTM now-playing metadata — set when a YTM track starts, cleared when Jellyfin
 // playback starts or the player goes idle. HA reports the raw stream URL as
@@ -150,16 +154,27 @@ function jfStreamUrl(itemId) {
 // Full-size cover art for the currently-playing Jellyfin track (public base —
 // browser-facing). Used as a fallback when HA gives us no entity_picture.
 function jfNowPlayingArt() {
-  if (!_jellyfinUrl) return null;
-  // Prefer track-level art; fall back to album art if the track has no Primary
-  // image (an onError handler on the NP img swaps to album art if this 404s).
-  if (_smcNowPlayingJfId) {
-    return `${_jellyfinUrl}/Items/${_smcNowPlayingJfId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
-  }
-  if (_smcNowPlayingJfAlbumId) {
-    return `${_jellyfinUrl}/Items/${_smcNowPlayingJfAlbumId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
-  }
-  return null;
+  if (!_jellyfinUrl || !_smcNowPlayingJfId) return null;
+  // Prefer the imageTag from the queue for correct cache-busting.
+  const qtrack = _smcQueue.find(t => t.id === _smcNowPlayingJfId);
+  if (qtrack?.imageTag) return jfImageUrl(_smcNowPlayingJfId, qtrack.imageTag);
+  // Fall back to the raw Primary endpoint (an onError handler on the NP img
+  // swaps to album art if this 404s).
+  return `${_jellyfinUrl}/Items/${_smcNowPlayingJfId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
+}
+
+// Fetch imageTag for a Jellyfin item ID directly from the API. Used when the
+// item isn't in _smcQueue (e.g. auto-detected after reload) — confirms a Primary
+// image exists before we register the item as the now-playing art source.
+async function jfFetchImageTag(itemId) {
+  if (!itemId || !_jellyfinUrl || !_jellyfinToken) return null;
+  try {
+    const r = await fetch(`${_jellyfinUrl}/Items/${itemId}/Images?api_key=${encodeURIComponent(_jellyfinToken)}`);
+    if (!r.ok) return null;
+    const images = await r.json();
+    const primary = Array.isArray(images) ? images.find(i => i.ImageType === 'Primary') : null;
+    return primary ? primary.ImageTag || null : null;
+  } catch { return null; }
 }
 
 // Build normalized browse rows for a navigation frame.
@@ -410,6 +425,7 @@ async function playYtmTrack(hass, eid, videoId, meta = {}, queue = null) {
   _ytmQueueEntityId = eid;
   _smcNowPlayingJfId = null;   // different source — drop Jellyfin art
   _smcNowPlayingJfAlbumId = null;
+  _smcLastFetchedArtId = null;
   _smcQueue = [];              // different source — drop Jellyfin queue
   _smcQueueEntityId = null;
   try {
@@ -435,7 +451,7 @@ async function enqueueYtmTrack(hass, eid, track) {
   // Cross-clear the opposing service's state — enqueueing into YTM makes YTM the
   // active source (mirrors what playYtmTrack does on the play path).
   if (_smcService === 'ytm') {
-    _smcNowPlayingJfId = null; _smcNowPlayingJfAlbumId = null; _smcQueue = []; _smcQueueEntityId = null;
+    _smcNowPlayingJfId = null; _smcNowPlayingJfAlbumId = null; _smcLastFetchedArtId = null; _smcQueue = []; _smcQueueEntityId = null;
   }
   // Scope the card-side queue to this speaker (mirrors enqueueJfTracks).
   if (_ytmQueueEntityId !== eid) { _ytmQueue = []; _ytmQueueEntityId = eid; }
@@ -1020,6 +1036,26 @@ function buildNpInfo(id, state, service = _smcService) {
         info.art = jfImageUrl(qtrack.albumId, null);
       }
     }
+    // Auto-detected track (queue empty after reload, so _smcNowPlayingJfId is
+    // null): extract the item id from media_content_id and confirm via the API
+    // that a Primary image exists, then register the id so the rest of the art
+    // pipeline treats it as known. Background fetch + _smcDirty re-render; the
+    // _smcLastFetchedArtId guard stops repeated fetches for the same item.
+    if (!_smcNowPlayingJfId && a.media_content_id) {
+      const m = a.media_content_id.match(/\/Audio\/([a-f0-9-]+)\/stream/i);
+      if (m) {
+        const extractedId = m[1];
+        if (_smcLastFetchedArtId !== extractedId) {
+          _smcLastFetchedArtId = extractedId;
+          jfFetchImageTag(extractedId).then(tag => {
+            if (tag) {
+              _smcNowPlayingJfId = extractedId;
+              _smcDirty = true;
+            }
+          });
+        }
+      }
+    }
     if (!info.art) {
       info.art = smcResolveImage(a.entity_picture);
     }
@@ -1263,7 +1299,15 @@ function BrowseView({ hass, selectedSpeakers, onTabChange, onToast }) {
       setLoading(true); setError(null);
       try {
         const r = await jfFetchRows(current);
-        if (!cancelled) setRows(r || []);
+        if (!cancelled) {
+          setRows(r || []);
+          // Auto-advance: if root returns exactly one music library, skip the
+          // root view straight to it (eliminates one tap). The breadcrumb still
+          // shows Library › Music so the user can navigate back.
+          if (current.kind === 'root' && r?.length === 1 && r[0].next) {
+            setStack(s => [...s, r[0].next]);
+          }
+        }
       } catch (e) {
         if (!cancelled) setError(e?.message || String(e));
       } finally {
@@ -1338,9 +1382,31 @@ function BrowseView({ hass, selectedSpeakers, onTabChange, onToast }) {
           ${rows.length === 0 && html`<p class="smc-loading">No items found</p>`}
           ${rows.map(row => {
             const img = row.imageTag ? jfImageUrl(row.id, row.imageTag) : null;
+            // Smart tap on non-track rows: if nothing is playing and this is a
+            // playable container (album/playlist), play it all immediately and
+            // jump to Now Playing; otherwise drill in. Track rows use TrackButtons.
+            const onTap = row.track
+              ? undefined
+              : row.next
+                ? async () => {
+                    const np = getNowPlaying(hassRef.current, selectedSpeakers);
+                    if (!np && (row.next.kind === 'album' || row.next.kind === 'playlist')) {
+                      const tracks = await jfFetchRows(row.next);
+                      const meta = tracks.filter(t => t.track).map(t => ({
+                        id: t.id, name: t.name, subtitle: t.subtitle, imageTag: t.imageTag, albumId: t.albumId,
+                      }));
+                      if (meta.length) {
+                        await playJfTracks(hassRef.current, eid, meta, 0);
+                        if (onTabChange) onTabChange('playing');
+                      }
+                    } else {
+                      push(row.next);
+                    }
+                  }
+                : undefined;
             return html`
               <div key=${row.id} class="smc-browse-row"
-                onClick=${row.track ? undefined : () => push(row.next)}>
+                onClick=${onTap}>
                 ${img
                   ? html`<img class="smc-browse-thumb" src=${img} alt="" loading="eager" />`
                   : html`<div class="smc-browse-thumb-placeholder">${row.icon || (row.track ? '♪' : '\u{1F4C1}')}</div>`
@@ -1510,9 +1576,30 @@ function SearchView({ hass, selectedSpeakers, onTabChange, onToast }) {
             ${drillRows.length === 0 && html`<p class="smc-loading">No items found</p>`}
             ${drillRows.map(row => {
               const img = row.imageTag ? jfImageUrl(row.id, row.imageTag) : null;
+              // Smart tap (mirrors BrowseView): nothing playing + album/playlist
+              // row → play all + jump to Now Playing; otherwise drill in.
+              const onTap = row.track
+                ? undefined
+                : row.next
+                  ? async () => {
+                      const np = getNowPlaying(hassRef.current, selectedSpeakers);
+                      if (!np && (row.next.kind === 'album' || row.next.kind === 'playlist')) {
+                        const tracks = await jfFetchRows(row.next);
+                        const meta = tracks.filter(t => t.track).map(t => ({
+                          id: t.id, name: t.name, subtitle: t.subtitle, imageTag: t.imageTag, albumId: t.albumId,
+                        }));
+                        if (meta.length) {
+                          await playJfTracks(hassRef.current, eid, meta, 0);
+                          if (onTabChange) onTabChange('playing');
+                        }
+                      } else {
+                        pushDrill(row.next);
+                      }
+                    }
+                  : undefined;
               return html`
                 <div key=${row.id} class="smc-browse-row"
-                  onClick=${row.track ? undefined : () => pushDrill(row.next)}>
+                  onClick=${onTap}>
                   ${img
                     ? html`<img class="smc-browse-thumb" src=${img} alt="" loading="eager" />`
                     : html`<div class="smc-browse-thumb-placeholder">${row.icon || (row.track ? '♪' : '\u{1F4C1}')}</div>`
@@ -2416,6 +2503,7 @@ function SonosMusicApp({ hass, config }) {
     if (service !== 'ytm' && !nowPlaying && _smcNowPlayingJfId) {
       _smcNowPlayingJfId = null;
       _smcNowPlayingJfAlbumId = null;
+      _smcLastFetchedArtId = null;
     }
   }, [nowPlaying, service]);
 

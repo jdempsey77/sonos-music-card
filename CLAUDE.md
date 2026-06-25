@@ -258,6 +258,23 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.19.3** — Three fixes.
+1. **Now Playing art for auto-detected tracks** — when `_smcNowPlayingJfId` is
+   null and `_smcQueue` is empty (e.g. after a reload), `buildNpInfo` extracts the
+   item id from `media_content_id` and kicks off `jfFetchImageTag()` — a direct
+   `/Items/{id}/Images` API call — to confirm a Primary image exists, then sets
+   `_smcNowPlayingJfId` + `_smcDirty` so the next render sources art as a known
+   track. New module state `_smcLastFetchedArtId` guards against repeated fetches
+   for the same item (cleared everywhere `_smcNowPlayingJfId` is). `jfNowPlayingArt()`
+   now prefers the queue's `imageTag` (correct cache-busting) over the raw endpoint.
+2. **Browse defaults to the library level** — the BrowseView fetch effect
+   auto-advances past the root view when exactly one music library is returned
+   (eliminates one tap). The breadcrumb still shows Library › Music so back-nav works.
+3. **Smart tap on album/playlist browse rows** — if nothing is playing, tapping an
+   album/playlist row plays it all immediately and jumps to Now Playing; if
+   something is playing it drills in as before. Track rows unchanged. Applied in
+   both BrowseView rows and SearchView drill rows.
+
 **v0.19.2** — Now Playing art uses the queue's `imageTag` as a fallback. When the
 Jellyfin art pipeline (known JF id → stream-URL extract → album fallback) all miss,
 `buildNpInfo` now looks up the current track in `_smcQueue` by id and reuses the same
@@ -491,6 +508,9 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [x] Jellyfin now-playing art album fallback (track has no Primary image) — v0.17.3
 - [x] Jellyfin art for auto-detected tracks (extract item ID from media_content_id) — v0.17.4
 - [x] Now Playing art queue imageTag fallback (reuse working queue-row art) — v0.19.2
+- [x] Now Playing art for auto-detected tracks via direct API imageTag fetch — v0.19.3
+- [x] Browse defaults to library level (auto-advance past root) — v0.19.3
+- [x] Smart tap on album/playlist rows (play-all when idle, drill when playing) — v0.19.3
 - [x] localStorage tracking-prevention console spam — v0.17.2 (safe storage wrapper)
 - [x] Auto-detect oscillation between two playing speakers (latch) — v0.18.0
 - [x] Render-phase side effects / impure `getNowPlaying` (moved to effects) — v0.18.0
