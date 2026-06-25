@@ -1,4 +1,4 @@
-// Sonos Music Card v0.20.1
+// Sonos Music Card v0.21.0
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -64,6 +64,18 @@
 // debounced-2s save. The POST is a CORS simple request (no Content-Type header →
 // text/plain) so it skips the preflight that nginx's GET/OPTIONS-only allow-methods
 // would reject; the server parses with get_json(force=True).
+// v0.21.0: Sonos favorites as a THIRD service (green pill in the ServiceBar,
+// alongside Jellyfin and YTM). One media_player.browse_media call returns Sonos's
+// own pre-categorized favorites tree (Radio / Playlists / Albums / Album_Artists)
+// with thumbnails and favorite_item_id content ids; SonosBrowseView renders it as
+// section-grouped rows, each with a play button. Playback is media_player.play_media
+// with media_content_type='favorite_item_id' targeted at the coordinator
+// (_smcSpeakers[0]) — no stream URL resolution, no external API, no auth beyond HA.
+// Favorite ids are index-based and volatile, so the tree is re-fetched on every
+// open and never persisted. Search is unavailable under Sonos (favorites have no
+// search); the Queue tab shows "Sonos manages its own queue". Now Playing is
+// unchanged — buildNpInfo reads HA state, and radio favorites surface the existing
+// external-source message (correct). Existing JF/YTM code paths are untouched.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -75,7 +87,8 @@ const html = htm.bind(h);
 let _smcConfig = {};
 
 // Active media service — drives what the Search and Browse tabs show.
-// 'jf' = Jellyfin, 'ytm' = YouTube Music. Toggled by the ServiceBar.
+// 'jf' = Jellyfin, 'ytm' = YouTube Music, 'sonos' = Sonos favorites (v0.21.0).
+// Toggled by the ServiceBar.
 let _smcService = 'jf';
 
 // ── Jellyfin config + client ────────────────────────────────────
@@ -554,6 +567,115 @@ function collapseFeaturingArtists(artists) {
   return result;
 }
 
+// ── Sonos favorites client (HA browse_media) ────────────────────
+// Sonos exposes its own favorites (radio, playlists, albums, artists) as a
+// pre-categorized tree through HA's media_player.browse_media service. Playback
+// reuses media_player.play_media with media_content_type='favorite_item_id'.
+// favorite_item_ids are INDEX-BASED and shift when favorites change, so the tree
+// is re-fetched on every open and never persisted.
+
+// Group a browse_media node's children by folder. Returns
+// [{folder, items:[{title, thumbnail, mediaContentId, mediaContentType}]}].
+// Expandable children (Radio / Playlists / Albums / Album_Artists) become folders
+// of their playable leaves; any top-level playable child lands in an "Other"
+// bucket. Folders with no playable items are dropped. Thumbnails are resolved
+// through smcResolveImage so HA-proxied relative paths render.
+function parseBrowseMediaResult(root) {
+  const children = root?.children || [];
+  const folders = [];
+  const toItem = (item) => ({
+    title: item.title,
+    thumbnail: smcResolveImage(item.thumbnail) || null,
+    mediaContentId: item.media_content_id,
+    mediaContentType: item.media_content_type || 'favorite_item_id',
+  });
+  for (const child of children) {
+    if (child.can_expand && child.children) {
+      folders.push({
+        folder: child.title,
+        items: (child.children || []).filter(i => i.can_play).map(toItem),
+      });
+    } else if (child.can_play) {
+      let misc = folders.find(f => f.folder === 'Other');
+      if (!misc) { misc = { folder: 'Other', items: [] }; folders.push(misc); }
+      misc.items.push(toItem(child));
+    }
+  }
+  return folders.filter(f => f.items.length);
+}
+
+// Browse one node of a speaker's media tree. Primary path is callService with
+// returnResponse (HA 2024.4+, positional signature); falls back to the WS
+// browse_media command (absent in some HA builds — hass.connection undefined).
+// Returns the BrowseMedia node or null.
+async function sonosBrowse(hass, entityId, contentId, contentType) {
+  const data = contentId
+    ? { entity_id: entityId, media_content_id: contentId, media_content_type: contentType }
+    : { entity_id: entityId };
+  try {
+    const result = await hass.callService('media_player', 'browse_media', data, undefined, false, true);
+    const root = result?.response ?? result;
+    if (root && (root.children || root.can_expand)) return root;
+  } catch (err) {
+    console.warn('[smc] browse_media callService failed:', err);
+  }
+  try {
+    if (hass.callWS) {
+      return await hass.callWS({
+        type: 'media_player/browse_media',
+        entity_id: entityId,
+        media_content_id: contentId,
+        media_content_type: contentType,
+      });
+    }
+  } catch (err) {
+    console.warn('[smc] browse_media WS failed:', err);
+  }
+  return null;
+}
+
+// Fetch Sonos favorites grouped by folder. Re-fetches every call — never cache
+// (favorite_item_ids are volatile). The Sonos media root contains a "Favorites"
+// node whose children are the category folders; if the root we get back already
+// IS that favorites tree (children are categories with playable leaves), we parse
+// it directly, otherwise we drill into the Favorites node first.
+async function sonosFetchFavorites(hass, entityId) {
+  if (!hass || !entityId) return [];
+  const root = await sonosBrowse(hass, entityId);
+  if (!root) return [];
+  let tree = root;
+  const favNode = (root.children || []).find(c =>
+    c.media_content_type === 'favorites' || /favorit/i.test(c.title || ''));
+  if (favNode && favNode.can_expand) {
+    const favTree = await sonosBrowse(hass, entityId, favNode.media_content_id, favNode.media_content_type);
+    if (favTree) tree = favTree;
+  }
+  return parseBrowseMediaResult(tree);
+}
+
+// Play a Sonos favorite on the coordinator. Sonos favorites replace current
+// playback (they don't queue), so this clears the card-side JF and YTM state —
+// the same cross-clear playJfTracks/playYtmTrack do — so Now Playing doesn't show
+// stale art from the previous service. Returns true on success.
+async function playSonosFavorite(hass, eid, item) {
+  if (!hass || !eid || !item) return false;
+  _smcNowPlayingJfId = null; _smcNowPlayingJfAlbumId = null; _smcLastFetchedArtId = null;
+  _smcQueue = []; _smcQueueEntityId = null;
+  _ytmNowPlaying = null; _ytmDirty = true; _ytmQueue = []; _ytmQueueEntityId = null;
+  try {
+    await hass.callService('media_player', 'play_media', {
+      entity_id: eid,
+      media_content_id: item.mediaContentId,
+      media_content_type: item.mediaContentType,
+    });
+    scheduleStateSave();
+    return true;
+  } catch (err) {
+    console.error('[smc] Sonos play failed:', err);
+    return false;
+  }
+}
+
 // ── Theme tokens ────────────────────────────────────────────────
 const THEME = {
   base: '#111111',
@@ -598,6 +720,7 @@ const IconChevron = () => html`<svg width="14" height="14" viewBox="0 0 24 24" f
 const IconMusicNote = () => html`<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>`;
 const IconYTM = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M23.5 6.19a3.02 3.02 0 0 0-2.12-2.14C19.54 3.5 12 3.5 12 3.5s-7.54 0-9.38.55A3.02 3.02 0 0 0 .5 6.19C0 8.04 0 12 0 12s0 3.96.5 5.81a3.02 3.02 0 0 0 2.12 2.14C4.46 20.5 12 20.5 12 20.5s7.54 0 9.38-.55a3.02 3.02 0 0 0 2.12-2.14C24 15.96 24 12 24 12s0-3.96-.5-5.81zM9.75 15.5v-7l6.5 3.5-6.5 3.5z"/></svg>`;
 const IconPlus = () => html`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`;
+const IconSonos = () => html`<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"/><circle cx="12" cy="14" r="3"/><line x1="12" y1="6" x2="12" y2="6.01"/></svg>`;
 
 // ── Styles ──────────────────────────────────────────────────────
 const cardStyles = `
@@ -976,6 +1099,7 @@ const cardStyles = `
   .smc-svc-chip svg { width: 13px; height: 13px; }
   .smc-svc-chip.jf.active { background: #0d1a2e; border-color: #14b8a6; color: #5eead4; }
   .smc-svc-chip.ytm.active { background: #1a0a0a; border-color: #dc2626; color: #f87171; }
+  .smc-svc-chip.sonos.active { background: #0a1a0a; border-color: #22c55e; color: #86efac; }
 
   /* ── Play + Queue buttons (every track row) ── */
   .smc-track-btns { display: flex; gap: 5px; flex-shrink: 0; }
@@ -1310,6 +1434,8 @@ function ServiceBar({ service, onService }) {
         onClick=${() => onService('jf')}>Jellyfin</button>
       <button class=${`smc-chip smc-svc-chip ytm${service === 'ytm' ? ' active' : ''}`}
         onClick=${() => onService('ytm')}><${IconYTM} />YouTube Music</button>
+      <button class=${`smc-chip smc-svc-chip sonos${service === 'sonos' ? ' active' : ''}`}
+        onClick=${() => onService('sonos')}><${IconSonos} />Sonos</button>
     </div>
   `;
 }
@@ -2001,6 +2127,89 @@ function YTMView({ hass, selectedSpeakers, onTabChange, onToast }) {
   `;
 }
 
+// ── Sonos Browse View (Sonos favorites via browse_media) ────────
+// Renders the speaker's own favorites tree — section-grouped rows, each with a
+// play button (no queue button: Sonos favorites replace current playback, they
+// don't enqueue card-side). Re-fetched on every open / speaker change; never
+// cached (favorite_item_ids are volatile). Targets the coordinator (_smcSpeakers[0]).
+function SonosBrowseView({ hass, selectedSpeakers, onTabChange, onToast }) {
+  const [folders, setFolders] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [playingId, setPlayingId] = useState(null);
+  const hassRef = useRef(hass);
+  hassRef.current = hass;
+  const eid = selectedSpeakers[0]; // coordinator
+
+  useEffect(() => {
+    if (!eid) return;
+    let cancelled = false;
+    (async () => {
+      setLoading(true); setError(null);
+      const result = await sonosFetchFavorites(hassRef.current, eid);
+      if (!cancelled) {
+        setFolders(result);
+        setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [eid]);
+
+  const playFavorite = useCallback(async (item) => {
+    if (!eid || playingId) return;
+    setPlayingId(item.mediaContentId);
+    const ok = await playSonosFavorite(hassRef.current, eid, item);
+    setPlayingId(null);
+    if (ok) {
+      if (onTabChange) onTabChange('playing');
+    } else if (onToast) {
+      onToast('Playback failed');
+    }
+  }, [eid, playingId, onTabChange, onToast]);
+
+  if (!eid) {
+    return html`<div class="smc-content"><p class="smc-header">Sonos</p><p class="smc-error">Select a speaker first</p></div>`;
+  }
+
+  return html`
+    <div class="smc-content">
+      ${loading && html`<p class="smc-loading">Loading favorites…</p>`}
+      ${error && html`<p class="smc-error">${error}</p>`}
+      ${!loading && !error && folders.length === 0 && html`
+        <p class="smc-loading">No favorites found</p>
+      `}
+      ${!loading && !error && folders.map(folder => html`
+        <p class="smc-section-label">${folder.folder}</p>
+        <div class="smc-browse-list">
+          ${folder.items.map(item => html`
+            <div key=${item.mediaContentId} class="smc-browse-row"
+              onClick=${() => playFavorite(item)}>
+              ${item.thumbnail
+                ? html`<img class="smc-browse-thumb" src=${item.thumbnail}
+                    alt="" loading="eager" referrerpolicy="no-referrer" />`
+                : html`<div class="smc-browse-thumb-placeholder">♪</div>`
+              }
+              <div class="smc-browse-info">
+                <p class="smc-browse-title">${item.title}</p>
+              </div>
+              <div class="smc-track-btns">
+                ${playingId === item.mediaContentId
+                  ? html`<div class="smc-row-spinner"></div>`
+                  : html`<button class="smc-tb smc-tb-play" title="Play"
+                      aria-label=${'Play ' + item.title}
+                      onClick=${(e) => { e.stopPropagation(); playFavorite(item); }}>
+                      <${IconPlay} size=${13} />
+                    </button>`
+                }
+              </div>
+            </div>
+          `)}
+        </div>
+      `)}
+    </div>
+  `;
+}
+
 // ── Queue View (card-side queue — Branch B) ─────────────────────
 function QueueView({ hass, selectedSpeakers, onTabChange, service, onToast }) {
   const hassRef = useRef(hass);
@@ -2045,6 +2254,18 @@ function QueueView({ hass, selectedSpeakers, onTabChange, service, onToast }) {
 
   if (!eid) {
     return html`<div class="smc-content"><p class="smc-header">Queue</p><p class="smc-error">Select a speaker first</p></div>`;
+  }
+
+  // Sonos manages its own queue on the speaker — the card never tracks a
+  // favorites queue (favorite_item_ids are volatile), so there's nothing to show.
+  if (service === 'sonos') {
+    return html`
+      <div class="np-empty">
+        <${IconMusicNote} />
+        <p class="np-empty-text">Sonos manages its own queue</p>
+        <button class="np-empty-btn" onClick=${(e) => { e.stopPropagation(); onTabChange('browse'); }}>Browse</button>
+      </div>
+    `;
   }
 
   if (!queue.length) {
@@ -2719,6 +2940,8 @@ function SonosMusicApp({ hass, config }) {
   const jfSearchVisible = activeTab === 'search' && service === 'jf';
   const jfBrowseVisible = activeTab === 'browse' && service === 'jf';
   const ytmVisible = (activeTab === 'search' || activeTab === 'browse') && service === 'ytm';
+  const sonosBrowseVisible = activeTab === 'browse' && service === 'sonos';
+  const sonosSearchVisible = activeTab === 'search' && service === 'sonos';
 
   return html`
     <div class="smc-card">
@@ -2740,6 +2963,14 @@ function SonosMusicApp({ hass, config }) {
       <div class=${`smc-tab-panel${ytmVisible ? '' : ' hidden'}`}>
         <${YTMView} hass=${hass} selectedSpeakers=${selectedSpeakers}
           onTabChange=${setActiveTab} onToast=${showToast} />
+      </div>
+      <div class=${`smc-tab-panel${sonosBrowseVisible ? '' : ' hidden'}`}>
+        <${SonosBrowseView} hass=${hass} selectedSpeakers=${selectedSpeakers}
+          onTabChange=${setActiveTab} onToast=${showToast} />
+      </div>
+      <div class=${`smc-tab-panel${sonosSearchVisible ? '' : ' hidden'}`}>
+        <div class="smc-content"><p class="smc-header">Search</p>
+          <p class="smc-loading">Search not available for Sonos favorites — use Browse.</p></div>
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'queue' ? ' hidden' : ''}`}>
         <${QueueView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} service=${service} onToast=${showToast} />

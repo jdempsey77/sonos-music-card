@@ -13,7 +13,7 @@
 ## Project overview
 Custom Home Assistant Lovelace card for Sonos speakers.
 Speaker selection, multi-room grouping, Now Playing with full transport controls,
-and a media browser backed by Jellyfin **and** YouTube Music.
+and a media browser backed by Jellyfin, YouTube Music, **and** Sonos favorites.
 
 **Layout (v0.19.0, top → bottom):** always-visible `SpeakerBar` (speaker chips —
 the chips ARE the group, no separate CTA) → `ServiceBar` (Jellyfin / YouTube Music
@@ -117,8 +117,9 @@ function getSpeakers(hass, config = _smcConfig) {
   for the next play). Tapping an ON chip unjoins it (stops it) and drops it from
   the selection. The **last** remaining speaker can never be deselected. Handled by
   `smcToggleSpeaker` — no separate "Play here" CTA. Always visible at top.
-- **`ServiceBar`** — Jellyfin / YouTube Music toggle, drives `_smcService`.
-  Active Jellyfin = teal accent, active YTM = red accent. **Rendered only on the
+- **`ServiceBar`** — Jellyfin / YouTube Music / **Sonos** toggle, drives
+  `_smcService`. Active Jellyfin = teal accent, active YTM = red accent, active
+  Sonos = green accent (`#0a1a0a`/`#22c55e`/`#86efac`). **Rendered only on the
   Search / Browse tabs** (a dead control on Queue / Now Playing; hidden + collapsed
   there).
 - **`BottomNav`** — 4 tabs only: Search, Browse, Queue, Now Playing.
@@ -148,7 +149,7 @@ The old `SpeakersView`/`SpeakerRow` are removed; their dead CSS (`.smc-spk-row`,
 ### Module-level state (survives Preact re-renders)
 ```js
 let _smcSpeakers = []        // selected speakers — single source of truth
-let _smcService = 'jf'       // active service: 'jf' (Jellyfin) | 'ytm' — drives Search/Browse
+let _smcService = 'jf'       // active service: 'jf' (Jellyfin) | 'ytm' | 'sonos' — drives Search/Browse
 let _smcUserSelected = false // true after explicit user tap — blocks auto-detect
 let _smcUserSelectedAt = 0   // timestamp of last user tap
 let _smcDirty = false        // signals Preact to re-render after auto-detect change
@@ -269,6 +270,35 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.21.0** — **Sonos favorites as a third service.** A green **Sonos** pill joins
+Jellyfin and YTM in the `ServiceBar` (`_smcService` now `'jf' | 'ytm' | 'sonos'`).
+Selecting it shows `SonosBrowseView` under the Browse tab: a single
+`media_player.browse_media` call returns Sonos's own pre-categorized favorites tree
+(Radio / Playlists / Albums / Album_Artists) with thumbnails and `favorite_item_id`
+content ids, rendered as section-grouped rows each with a play button. Playback is
+`media_player.play_media` with `media_content_type='favorite_item_id'` targeted at
+the coordinator (`_smcSpeakers[0]`) — the simplest of the three services (no stream
+URL resolution, no external API, no auth beyond HA). `favorite_item_id`s are
+**index-based and volatile**, so the tree is re-fetched on every open and never
+persisted. Search is unavailable under Sonos (the Search panel shows a "use Browse"
+note); the Queue tab shows "Sonos manages its own queue". Now Playing is unchanged
+— `buildNpInfo` reads HA state; a radio favorite surfaces the existing
+external-source message (`QUEUE_SOURCES` already includes `'Sonos Queue'`).
+`playSonosFavorite` cross-clears the JF/YTM now-playing + queue state (like the JF
+and YTM play paths) so stale art never bleeds across services. `_smcService='sonos'`
+persists via the existing ytm-service state blob. Existing JF/YTM code paths untouched.
+
+Implementation notes:
+- `sonosFetchFavorites(hass, eid)` → `sonosBrowse` (primary: `hass.callService(...,
+  returnResponse=true)` positional signature; fallback: `hass.callWS` browse_media,
+  absent in this HA build). The Sonos media root holds a **Favorites** node whose
+  children are the category folders, so the fetch drills into that node if the root
+  isn't already the favorites tree, then `parseBrowseMediaResult` groups can-expand
+  children into folders of their `can_play` leaves (thumbnails via `smcResolveImage`;
+  empty folders dropped).
+- Browse-tab routing in `SonosMusicApp`: `sonosBrowseVisible` / `sonosSearchVisible`
+  mirror the JF/YTM panel-visibility flags; all panels stay mounted (CSS-hidden).
+
 **v0.20.1** — Cross-device state backend swapped from HA WebSocket to ytm-service.
 The v0.20.0 approach used HA's `frontend/{get,set}_user_data` WS API, but that API
 is **absent in this HA build** (`hass.connection` is undefined), so it silently
@@ -568,11 +598,40 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - **Deps on ska**: `pip3 install yt-dlp ytmusicapi flask --break-system-packages`
   (installed to `~/.local`, importable by `/usr/bin/python3` as user jdempsey).
 
+## Sonos favorites service (v0.21.0)
+The third media service — and the only one with **no backend at all**. Sonos
+exposes its own favorites through HA, so the card just calls HA services from the
+browser; there is no ska component, no nginx route, no auth beyond HA.
+- **Fetch**: `media_player.browse_media`. Primary path is
+  `hass.callService('media_player', 'browse_media', {entity_id}, undefined, false, true)`
+  (returnResponse, positional signature — HA 2024.4+); fallback is the
+  `media_player/browse_media` WS command (`hass.callWS`), which is **absent in this
+  HA build** (`hass.connection` undefined) but kept as a graceful degrade.
+- **Tree shape**: the speaker's media root contains a **Favorites** node whose
+  children are the category folders **Radio / Playlists / Albums / Album_Artists**;
+  `sonosFetchFavorites` drills into that node (if the root isn't already the
+  favorites tree) and `parseBrowseMediaResult` groups can-expand children into
+  folders of their `can_play` leaves. Each leaf has `title`, `thumbnail`,
+  `media_content_id` (e.g. `FV:2/9`), `media_content_type: 'favorite_item_id'`.
+- **Playback**: `media_player.play_media` with
+  `media_content_type='favorite_item_id'`, targeted at the coordinator
+  (`_smcSpeakers[0]`). Sonos favorites **replace** current playback — they don't
+  enqueue card-side — so `playSonosFavorite` cross-clears JF/YTM now-playing + queue
+  state. No stream URL resolution needed (the simplest of the three services).
+- **Volatility**: `favorite_item_id`s are **index-based** and shift when favorites
+  change, so the tree is re-fetched on every Browse open and **never persisted**.
+  (`_smcService='sonos'` itself does persist via the ytm-service state blob.)
+- **Tabs under Sonos**: Browse = `SonosBrowseView`; Search = "use Browse" note
+  (favorites have no search); Queue = "Sonos manages its own queue"; Now Playing =
+  unchanged (`buildNpInfo` reads HA state; radio favorites show the external-source
+  message — `QUEUE_SOURCES` already includes `'Sonos Queue'`).
+
 ## Open work
 - [x] Search tab (Jellyfin search API) — v0.14.0
 - [x] Now Playing queue view — v0.15.0 (Queue tab, card-side, read-only)
 - [x] Artist/album "Play all" affordance in Browse — v0.15.0 (Play All + Add All)
 - [x] YouTube Music support — v0.16.0 (ytm-service on ska; search + stream via yt-dlp)
+- [x] Sonos favorites support — v0.21.0 (browse_media tree, play_media favorite_item_id)
 - [ ] "Shuffle" affordance for Play All / Add All
 - [ ] Queue reorder / delete (Queue tab is read-only this version)
 - [ ] Art that tracks queue advance (currently shows first track's art only)
