@@ -258,6 +258,17 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.19.6** — **Save as Playlist** in the Queue tab (Jellyfin only — the button is
+hidden when `_smcService === 'ytm'`). The queue-count row gained a **Save as
+playlist** button next to **Clear**; tapping it opens an inline name input
+(prefilled "My Playlist") with **Save**/**Cancel**. Save collects the queue's
+Jellyfin track ids and calls the new `jfCreatePlaylist(name, trackIds)` helper —
+`POST /Playlists?api_key=…` with `{ Name, Ids, UserId, MediaType: 'Audio' }`.
+`UserId` (from `jfGetUserId`) is **required** in the body for the playlist API
+under API-key auth — omitting it 400s. A toast confirms `Saved "<name>"`; failure
+shows an inline error for 3s. `onToast` is now wired through to QueueView. The
+card-side queue is unchanged — this just persists it as a Jellyfin playlist.
+
 **v0.19.5** — Last-speaker chip guard is now **playback-conditional**. Tapping the
 only selected chip used to be a no-op (the guard blocked deselect outright). Now:
 tapping it while **idle** deselects to zero (the card shows "Select a speaker
