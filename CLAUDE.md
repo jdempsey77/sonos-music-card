@@ -156,8 +156,7 @@ let _smcNowPlayingJfId = null      // current Jellyfin track id (for art)
 let _smcNowPlayingJfAlbumId = null // current Jellyfin album id — art is album-first (v0.20.0)
 let _smcQueue = []           // card-side Jellyfin queue [{id,name,subtitle,imageTag,albumId}]
 let _ytmQueue = []           // card-side YTM queue
-let _smcHass = null          // latest hass, for state-save hooks lacking a hass arg (v0.20.0)
-let _haStateSaveTimer = null // debounce timer for HA user-data save (v0.20.0)
+let _haStateSaveTimer = null // debounce timer for ytm-service /state save (v0.20.0)
 ```
 
 ### Key functions
@@ -165,7 +164,7 @@ let _haStateSaveTimer = null // debounce timer for HA user-data save (v0.20.0)
 |---|---|
 | `smcInit(hass)` | Cold load. Seeds `_smcSpeakers` from playing state or localStorage. On first `set hass` the card also calls `loadStateFromHA` to rehydrate queue/service/now-playing (v0.20.0) |
 | `smcAutoDetect(hass)` | Every hass update. Promotes a playing speaker if nothing selected |
-| `loadStateFromHA(hass)` / `scheduleStateSave(hass)` / `buildStateBlob()` | Cross-device state (v0.20.0). Persist `service` + both queues + now-playing ids to HA `frontend/set_user_data` (key `sonos_music_card`) over the existing WebSocket; load on init. Save is debounced 2s and called at every queue/service/now-playing mutation. Silent in-memory fallback if `hass.connection.sendMessagePromise` is unavailable |
+| `loadStateFromHA()` / `scheduleStateSave()` / `buildStateBlob()` | Cross-device state (v0.20.0; backend switched to ytm-service in v0.20.1). Persist `service` + both queues + now-playing ids to ytm-service `GET/POST ${ytm_url}/state` (SQLite-backed on ska); load on init. Save debounced 2s, called at every queue/service/now-playing mutation. The POST is a CORS **simple request** (no `Content-Type` header → `text/plain`) to skip the preflight nginx would reject; server parses with `get_json(force=True)`. Silent in-memory fallback if the endpoint is unreachable. (The name `loadStateFromHA` is retained for continuity; the backend is no longer HA — its WS `frontend/*_user_data` API is absent in this build.) |
 | `jfFetchTrackAlbumInfo(trackId)` | (v0.20.0, replaces `jfFetchImageTag`) Fetch `AlbumId` + `AlbumPrimaryImageTag` for a track in one `/Items?Ids=…&Fields=…` call — used to resolve **album** art for auto-detected tracks, since most tracks have no track-level image |
 | `smcToggleSpeaker(entityId, hass)` | Chip toggle = group membership (clean on/off, v0.19.0). Add → simple `join` to the active coordinator if something's playing, else just select; remove → `unjoin` (stops). Removing the **last** speaker is playback-conditional (v0.19.5): if it's playing, `media_stop` first, then deselect to zero; if idle, just deselect to zero. Async; `_smcSpeakers` mutates synchronously for optimistic UI. Sets `_smcUserSelected = true` |
 | `transportPlayPause/Next/Prev(hass, entityId)` | Shared transport (v0.19.0) used by both BottomBar and NowPlayingView. Play/pause → HA `media_play_pause`. Next/prev resolve the adjacent queue track card-side and `play_media` it when the active service has a card-side queue — YTM via `ytmAdjacent`/`_ytmQueue`, Jellyfin via `jfAdjacent`/`_smcQueue` (v0.19.1; HA `media_next_track` no-ops on native Sonos entities queued via `play_media`). Falls back to HA `media_*` services when the queue is empty |
@@ -270,6 +269,17 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.20.1** — Cross-device state backend swapped from HA WebSocket to ytm-service.
+The v0.20.0 approach used HA's `frontend/{get,set}_user_data` WS API, but that API
+is **absent in this HA build** (`hass.connection` is undefined), so it silently
+no-op'd. Replaced with a SQLite-backed `GET/POST /ytm/state` endpoint on
+ytm-service (Option A). Same card-side interface (`loadStateFromHA` /
+`scheduleStateSave`, now arg-less; `_smcHass` removed) and same debounced-2s save.
+The card POSTs as a **CORS simple request** (no `Content-Type` header → `text/plain`)
+so it avoids a preflight that nginx's `GET, OPTIONS`-only allow-methods would
+reject; the Flask route parses with `get_json(force=True)`. Verified end-to-end via
+nginx (GET + POST round-trip, `Access-Control-Allow-Origin: *` on responses).
+
 **v0.20.0** — Three fixes.
 1. **Art pipeline rewritten album-first.** Empirically, most tracks have **no
    track-level image** — the cover lives on the album, so the raw
@@ -588,10 +598,11 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [x] Speaker chip model simplified (clean join/unjoin, no rejoin dance) — v0.19.0
 - [x] Album thumbnails in Browse (maxHeight/maxWidth + imageTag audit) — v0.19.0
 - [x] Queue + YTM now-playing persistence across reload **and across devices** —
-  v0.20.0 via HA `frontend/{get,set}_user_data` over the existing WebSocket
-  (per-user, cross-device). Supersedes the prior "intentionally not implemented"
-  stance: `localStorage` was the blocker (Edge tracking prevention), and HA
-  user-data sidesteps it with no new infrastructure.
+  v0.20.1 via ytm-service `GET/POST /ytm/state` (SQLite on ska). Supersedes both
+  the prior "intentionally not implemented" stance (`localStorage` blocked by Edge
+  tracking prevention) and the v0.20.0 HA `frontend/*_user_data` WS attempt (that
+  API is absent in this HA build). The state endpoint reuses the existing
+  ytm-service + nginx — no new service.
 
 ## Session startup checklist
 1. Read this file (`cat ~/code/sonos-music-card/CLAUDE.md`)

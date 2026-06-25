@@ -1,4 +1,4 @@
-// Sonos Music Card v0.20.0
+// Sonos Music Card v0.20.1
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -57,6 +57,13 @@
 // frontend/{get,set}_user_data over the existing WebSocket (per-user, cross-device,
 // no new infra). Debounced 2s save on every mutation; load on init; silent
 // in-memory fallback if the WS command is unavailable.
+// v0.20.1: the HA frontend/{get,set}_user_data WS API is absent in this HA build
+// (hass.connection undefined), so cross-device state moved to ytm-service:
+// GET/POST ${ytm_url}/state, SQLite-backed on ska. Same card-side interface
+// (loadStateFromHA / scheduleStateSave, now arg-less; _smcHass removed) and same
+// debounced-2s save. The POST is a CORS simple request (no Content-Type header →
+// text/plain) so it skips the preflight that nginx's GET/OPTIONS-only allow-methods
+// would reject; the server parses with get_json(force=True).
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -323,7 +330,7 @@ async function playJfTracks(hass, eid, tracks, startIndex = 0) {
     _smcNowPlayingJfAlbumId = slice[0]?.albumId || null;
     _smcQueue = slice.map(toQueueItem);
     _smcQueueEntityId = eid;
-    scheduleStateSave(hass);
+    scheduleStateSave();
   } catch (err) {
     console.error('[smc] play failed:', err);
     return;
@@ -365,7 +372,7 @@ async function enqueueJfTracks(hass, eid, tracks) {
       added++;
     } catch { break; }
   }
-  if (added) scheduleStateSave(hass);
+  if (added) scheduleStateSave();
   return added;
 }
 
@@ -382,7 +389,7 @@ async function jumpToQueueTrack(hass, eid, track) {
     });
     _smcNowPlayingJfId = track.id;
     _smcNowPlayingJfAlbumId = track.albumId || null;
-    scheduleStateSave(hass);
+    scheduleStateSave();
   } catch (err) { console.error('[smc] jump failed:', err); }
 }
 
@@ -465,7 +472,7 @@ async function playYtmTrack(hass, eid, videoId, meta = {}, queue = null) {
       media_content_id: url,
       media_content_type: 'music',
     });
-    scheduleStateSave(hass);
+    scheduleStateSave();
     return true;
   } catch (err) {
     console.error('[smc] YTM play failed:', err);
@@ -494,7 +501,7 @@ async function enqueueYtmTrack(hass, eid, track) {
     });
     _ytmQueue.push(toYtmQueueItem(track));
     _ytmDirty = true;
-    scheduleStateSave(hass);
+    scheduleStateSave();
     return true;
   } catch (err) {
     console.error('[smc] YTM enqueue failed:', err);
@@ -1210,7 +1217,7 @@ async function ytmAdjacent(hass, entityId, delta) {
     await hass.callService('media_player', 'play_media', {
       entity_id: entityId, media_content_id: url, media_content_type: 'music',
     });
-    scheduleStateSave(hass);
+    scheduleStateSave();
   } catch (err) { console.error('[smc] YTM transport failed:', err); }
 }
 async function jfAdjacent(hass, entityId, delta) {
@@ -1225,7 +1232,7 @@ async function jfAdjacent(hass, entityId, delta) {
     });
     _smcNowPlayingJfId = track.id;
     _smcNowPlayingJfAlbumId = track.albumId || null;
-    scheduleStateSave(hass);
+    scheduleStateSave();
   } catch (err) { console.error('[smc] JF transport failed:', err); }
 }
 async function transportNext(hass, entityId) {
@@ -2074,7 +2081,7 @@ function QueueView({ hass, selectedSpeakers, onTabChange, service, onToast }) {
             } else {
               _smcQueue = []; _smcQueueEntityId = null; _smcNowPlayingJfId = null; _smcNowPlayingJfAlbumId = null; _smcLastFetchedArtId = null;
             }
-            scheduleStateSave(hass);
+            scheduleStateSave();
             force(n => n + 1);
           }}>Clear</button>
         </div>
@@ -2454,21 +2461,24 @@ function storageLoad(key) {
   try { return localStorage.getItem(key); } catch { return null; }
 }
 
-// ── Cross-device state via HA frontend user-data ─────────────────
-// localStorage is blocked by Edge tracking prevention in this HA context, so the
-// queue + service + now-playing live only in module memory and reset on every
-// load. HA's frontend/set_user_data + frontend/get_user_data store a JSON blob
-// server-side, scoped to the HA user — so the same user sees the same queue on a
-// Mac and a phone. No new infrastructure: it rides the WebSocket the card already
-// holds via hass.connection. Load-time restore (not real-time sync); saves are
-// debounced 2s so a burst of queue edits collapses into one write. Silently falls
-// back to in-memory behavior if the WS command is unavailable.
-const SMC_HA_KEY = 'sonos_music_card';
-let _smcHass = null;            // latest hass, for save hooks that lack a hass arg
+// ── Cross-device state via ytm-service /ytm/state ────────────────
+// localStorage is blocked by Edge tracking prevention in this HA context, and HA's
+// frontend/{get,set}_user_data WS API is absent in this HA build (hass.connection
+// undefined), so the queue + service + now-playing would otherwise live only in
+// module memory and reset on every load. Instead we persist a single JSON blob to
+// ytm-service (GET/POST ${_ytmServiceUrl}/state, SQLite-backed on ska) — the same
+// origin the card already calls for YTM. Load-time restore; saves debounced 2s.
+// Silent in-memory fallback if the endpoint is unreachable.
+//
+// CORS: the card runs on the HA origin, cross-origin to ytm-service. nginx allows
+// only GET/OPTIONS in the preflight methods, so to skip the preflight entirely the
+// POST is a CORS "simple request" — no Content-Type header, so it defaults to
+// text/plain. The server parses with get_json(force=True) regardless. A simple
+// request only needs Access-Control-Allow-Origin:* on the response (nginx adds it).
 let _haStateSaveTimer = null;
 
 function buildStateBlob() {
-  return JSON.stringify({
+  return {
     v: 1,
     service: _smcService,
     smcQueue: _smcQueue,
@@ -2478,43 +2488,39 @@ function buildStateBlob() {
     ytmNowPlaying: _ytmNowPlaying,
     smcNowPlayingJfId: _smcNowPlayingJfId,
     smcNowPlayingJfAlbumId: _smcNowPlayingJfAlbumId,
-  });
+  };
 }
 
-function scheduleStateSave(hass) {
-  const h = hass || _smcHass;
-  if (!h?.connection?.sendMessagePromise) return;
+function scheduleStateSave() {
   if (_haStateSaveTimer) clearTimeout(_haStateSaveTimer);
   _haStateSaveTimer = setTimeout(async () => {
     _haStateSaveTimer = null;
+    if (!_ytmServiceUrl) return;
     try {
-      await h.connection.sendMessagePromise({
-        type: 'frontend/set_user_data', key: SMC_HA_KEY, value: buildStateBlob(),
-      });
+      // No Content-Type header on purpose → CORS simple request (see note above).
+      await fetch(`${_ytmServiceUrl}/state`, { method: 'POST', body: JSON.stringify(buildStateBlob()) });
+      console.log('[smc] state saved');
     } catch (e) { console.warn('[smc] state save failed:', e); }
   }, 2000);
 }
 
-async function loadStateFromHA(hass) {
-  if (!hass?.connection?.sendMessagePromise) return;
+async function loadStateFromHA() {
+  if (!_ytmServiceUrl) return;
   try {
-    const result = await hass.connection.sendMessagePromise({
-      type: 'frontend/get_user_data', key: SMC_HA_KEY,
-    });
-    const blob = result?.value;
-    if (!blob) return;
-    const state = JSON.parse(blob);
+    const r = await fetch(`${_ytmServiceUrl}/state`);
+    if (!r.ok) return;
+    const state = await r.json();
     if (!state || state.v !== 1) return;
     if (state.service) _smcService = state.service;
-    if (Array.isArray(state.smcQueue)) _smcQueue = state.smcQueue;
+    if (Array.isArray(state.smcQueue) && state.smcQueue.length) _smcQueue = state.smcQueue;
     if (state.smcQueueEntityId) _smcQueueEntityId = state.smcQueueEntityId;
-    if (Array.isArray(state.ytmQueue)) _ytmQueue = state.ytmQueue;
+    if (Array.isArray(state.ytmQueue) && state.ytmQueue.length) _ytmQueue = state.ytmQueue;
     if (state.ytmQueueEntityId) _ytmQueueEntityId = state.ytmQueueEntityId;
     if (state.ytmNowPlaying) _ytmNowPlaying = state.ytmNowPlaying;
     if (state.smcNowPlayingJfId) _smcNowPlayingJfId = state.smcNowPlayingJfId;
     if (state.smcNowPlayingJfAlbumId) _smcNowPlayingJfAlbumId = state.smcNowPlayingJfAlbumId;
     _smcDirty = true;
-    console.log('[smc] state restored from HA:', state.smcQueue?.length || 0, 'jf,', state.ytmQueue?.length || 0, 'ytm');
+    console.log('[smc] state restored:', state.smcQueue?.length || 0, 'jf,', state.ytmQueue?.length || 0, 'ytm');
   } catch (e) { console.warn('[smc] state load failed:', e); }
 }
 
@@ -2694,7 +2700,7 @@ function SonosMusicApp({ hass, config }) {
 
   // Service toggle — mirror into module state so the views read it consistently,
   // and into React state so the panels re-render/re-fetch.
-  const setService = useCallback((s) => { _smcService = s; setServiceState(s); scheduleStateSave(_smcHass); }, []);
+  const setService = useCallback((s) => { _smcService = s; setServiceState(s); scheduleStateSave(); }, []);
 
   // One-at-a-time toast: shown, then auto-dismissed after 1.8s (the CSS animation
   // handles the fade; unmounting at the same time keeps only one toast alive).
@@ -2753,13 +2759,12 @@ class SonosMusicCard extends HTMLElement {
   constructor() { super(); this._hass = null; this._config = {}; this._initialized = false; }
   set hass(hass) {
     this._hass = hass;
-    _smcHass = hass;
     if (!this._initialized) {
       this._initialized = true;
       smcInit(hass);
-      // Rehydrate queue/service/now-playing from HA user-data (cross-device),
-      // then re-render once it resolves. Best-effort — no-ops if WS unavailable.
-      loadStateFromHA(hass).then(() => { if (this._root) this._renderApp(); });
+      // Rehydrate queue/service/now-playing from ytm-service (cross-device), then
+      // re-render once it resolves. Best-effort — no-ops if the endpoint is down.
+      loadStateFromHA().then(() => { if (this._root) this._renderApp(); });
       this._init();
     } else {
       // On every subsequent hass update, auto-detect any newly playing speaker
