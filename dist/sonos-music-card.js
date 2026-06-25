@@ -1,4 +1,4 @@
-// Sonos Music Card v0.19.5
+// Sonos Music Card v0.19.6
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -132,6 +132,29 @@ async function jfGetUserId() {
     _jellyfinUserId = (admin || users[0]).Id || null;
   }
   return _jellyfinUserId;
+}
+
+// Create a new Jellyfin playlist from a list of track IDs. Returns the new
+// playlist ID on success, null on failure. Auth via api_key query param (the
+// pattern used everywhere else here) and UserId in the body — both required for
+// the playlist API under API-key auth.
+async function jfCreatePlaylist(name, trackIds) {
+  if (!_jellyfinUrl || !_jellyfinToken || !name || !trackIds?.length) return null;
+  const uid = await jfGetUserId();
+  if (!uid) return null;
+  try {
+    const r = await fetch(
+      `${_jellyfinUrl}/Playlists?api_key=${encodeURIComponent(_jellyfinToken)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ Name: name, Ids: trackIds, UserId: uid, MediaType: 'Audio' }),
+      }
+    );
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data.Id || null;
+  } catch { return null; }
 }
 
 // Primary image (public endpoint — no token required). Uses maxHeight/maxWidth
@@ -1968,12 +1991,14 @@ function YTMView({ hass, selectedSpeakers, onTabChange, onToast }) {
 }
 
 // ── Queue View (card-side queue — Branch B) ─────────────────────
-function QueueView({ hass, selectedSpeakers, onTabChange, service }) {
+function QueueView({ hass, selectedSpeakers, onTabChange, service, onToast }) {
   const hassRef = useRef(hass);
   hassRef.current = hass;
   const eid = selectedSpeakers[0];
   const [, force] = useState(0);
   const [loadingId, setLoadingId] = useState(null);
+  const [saveState, setSaveState] = useState(null); // null | 'input' | 'saving' | 'saved' | 'error'
+  const [playlistName, setPlaylistName] = useState('');
 
   const np = useMemo(() => getNowPlaying(hass, selectedSpeakers, service), [hass, selectedSpeakers, service]);
 
@@ -2032,15 +2057,58 @@ function QueueView({ hass, selectedSpeakers, onTabChange, service }) {
     <div class="smc-content">
       <div style="display:flex;align-items:center;justify-content:space-between;margin:0 0 8px 4px;">
         <p class="smc-queue-count" style="margin:0;">${queue.length} track${queue.length !== 1 ? 's' : ''}</p>
-        <button class="smc-action-btn" onClick=${() => {
-          if (_smcService === 'ytm') {
-            _ytmQueue = []; _ytmQueueEntityId = null; _ytmNowPlaying = null; _ytmDirty = true;
-          } else {
-            _smcQueue = []; _smcQueueEntityId = null; _smcNowPlayingJfId = null; _smcNowPlayingJfAlbumId = null; _smcLastFetchedArtId = null;
-          }
-          force(n => n + 1);
-        }}>Clear</button>
+        <div style="display:flex;gap:6px;align-items:center;">
+          ${!isYtm && saveState === null && html`
+            <button class="smc-action-btn" onClick=${() => {
+              setPlaylistName('My Playlist');
+              setSaveState('input');
+            }}>Save as playlist</button>
+          `}
+          <button class="smc-action-btn" onClick=${() => {
+            if (_smcService === 'ytm') {
+              _ytmQueue = []; _ytmQueueEntityId = null; _ytmNowPlaying = null; _ytmDirty = true;
+            } else {
+              _smcQueue = []; _smcQueueEntityId = null; _smcNowPlayingJfId = null; _smcNowPlayingJfAlbumId = null; _smcLastFetchedArtId = null;
+            }
+            force(n => n + 1);
+          }}>Clear</button>
+        </div>
       </div>
+      ${saveState === 'input' && html`
+        <div style="display:flex;gap:6px;padding:0 4px 12px;align-items:center;">
+          <input
+            class="smc-search-input"
+            style="flex:1;"
+            type="text"
+            value=${playlistName}
+            placeholder="Playlist name…"
+            onInput=${e => setPlaylistName(e.target.value)}
+          />
+          <button class="smc-action-btn primary"
+            disabled=${!playlistName.trim() || saveState === 'saving'}
+            onClick=${async () => {
+              setSaveState('saving');
+              const ids = queue.map(t => t.id).filter(Boolean);
+              const result = await jfCreatePlaylist(playlistName.trim(), ids);
+              if (result) {
+                setSaveState('saved');
+                if (onToast) onToast(`Saved "${playlistName.trim()}"`);
+                setTimeout(() => setSaveState(null), 2000);
+              } else {
+                setSaveState('error');
+                setTimeout(() => setSaveState(null), 3000);
+              }
+            }}>
+            ${saveState === 'saving' ? 'Saving…' : 'Save'}
+          </button>
+          <button class="smc-action-btn" onClick=${() => setSaveState(null)}>Cancel</button>
+        </div>
+      `}
+      ${saveState === 'error' && html`
+        <p style="font-size:11px;color:#ef4444;padding:0 4px 8px;">
+          Failed to save — check Jellyfin connection
+        </p>
+      `}
       <div class="smc-browse-list">
         ${queue.map((q, i) => {
           const cur = isCurrent(q);
@@ -2583,7 +2651,7 @@ function SonosMusicApp({ hass, config }) {
           onTabChange=${setActiveTab} onToast=${showToast} />
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'queue' ? ' hidden' : ''}`}>
-        <${QueueView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} service=${service} />
+        <${QueueView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} service=${service} onToast=${showToast} />
       </div>
       <div class=${`smc-tab-panel${activeTab !== 'playing' ? ' hidden' : ''}`}>
         <${NowPlayingView} hass=${hass} selectedSpeakers=${selectedSpeakers} onTabChange=${setActiveTab} service=${service} />
