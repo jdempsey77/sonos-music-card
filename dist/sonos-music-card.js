@@ -1,4 +1,4 @@
-// Sonos Music Card v0.19.6
+// Sonos Music Card v0.20.0
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -43,6 +43,20 @@
 // speaker can't be deselected; the playing dot shows only when selected+playing.
 // Album thumbnails: jfImageUrl uses maxHeight/maxWidth (not fillHeight/fillWidth)
 // and imageTag is set consistently across every jfFetchRows path.
+// v0.20.0: (1) Art pipeline rewritten album-first — most tracks have NO track-
+// level image (art lives on the album), so the raw /Items/{track}/Images/Primary
+// endpoint 404s. buildNpInfo now resolves album art via jfImageUrl(albumId);
+// jfFetchTrackAlbumInfo (replaces jfFetchImageTag) fetches AlbumId +
+// AlbumPrimaryImageTag in one call for auto-detected tracks. The sticky
+// imperative onError display:none (which Preact never restored on the reconciled
+// <img>) is replaced by an artError state flag that resets on art URL change.
+// (2) Volume sliders derive from _smcSpeakers (the card's selection) not HA
+// group_members — an unrelated Sonos group (e.g. living room on TV) no longer
+// appears as a volume target; external-source speakers show a note, not a slider.
+// (3) Cross-device state: queue + service + now-playing persist via HA
+// frontend/{get,set}_user_data over the existing WebSocket (per-user, cross-device,
+// no new infra). Debounced 2s save on every mutation; load on init; silent
+// in-memory fallback if the WS command is unavailable.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -174,29 +188,20 @@ function jfStreamUrl(itemId) {
   return `${_jellyfinInternalUrl}/Audio/${itemId}/stream.mp3?api_key=${encodeURIComponent(_jellyfinToken)}&audioCodec=mp3&Container=mp3`;
 }
 
-// Full-size cover art for the currently-playing Jellyfin track (public base —
-// browser-facing). Used as a fallback when HA gives us no entity_picture.
-function jfNowPlayingArt() {
-  if (!_jellyfinUrl || !_smcNowPlayingJfId) return null;
-  // Prefer the imageTag from the queue for correct cache-busting.
-  const qtrack = _smcQueue.find(t => t.id === _smcNowPlayingJfId);
-  if (qtrack?.imageTag) return jfImageUrl(_smcNowPlayingJfId, qtrack.imageTag);
-  // Fall back to the raw Primary endpoint (an onError handler on the NP img
-  // swaps to album art if this 404s).
-  return `${_jellyfinUrl}/Items/${_smcNowPlayingJfId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
-}
-
-// Fetch imageTag for a Jellyfin item ID directly from the API. Used when the
-// item isn't in _smcQueue (e.g. auto-detected after reload) — confirms a Primary
-// image exists before we register the item as the now-playing art source.
-async function jfFetchImageTag(itemId) {
-  if (!itemId || !_jellyfinUrl || !_jellyfinToken) return null;
+// Fetch the album id + album image tag for a track directly from the API. Used
+// when the track was auto-detected (not played from the card) and the album id
+// is unknown. Tracks frequently have no track-level Primary image — the cover is
+// on the album — so we resolve AlbumId/AlbumPrimaryImageTag and render via the
+// album, which is the only endpoint that reliably returns an image.
+async function jfFetchTrackAlbumInfo(trackId) {
+  if (!trackId || !_jellyfinUrl || !_jellyfinToken) return null;
   try {
-    const r = await fetch(`${_jellyfinUrl}/Items/${itemId}/Images?api_key=${encodeURIComponent(_jellyfinToken)}`);
+    const r = await fetch(`${_jellyfinUrl}/Items?Ids=${encodeURIComponent(trackId)}&Fields=AlbumId,AlbumPrimaryImageTag&api_key=${encodeURIComponent(_jellyfinToken)}`);
     if (!r.ok) return null;
-    const images = await r.json();
-    const primary = Array.isArray(images) ? images.find(i => i.ImageType === 'Primary') : null;
-    return primary ? primary.ImageTag || null : null;
+    const data = await r.json();
+    const item = data?.Items?.[0];
+    if (!item) return null;
+    return { albumId: item.AlbumId || null, albumTag: item.AlbumPrimaryImageTag || null };
   } catch { return null; }
 }
 
@@ -318,6 +323,7 @@ async function playJfTracks(hass, eid, tracks, startIndex = 0) {
     _smcNowPlayingJfAlbumId = slice[0]?.albumId || null;
     _smcQueue = slice.map(toQueueItem);
     _smcQueueEntityId = eid;
+    scheduleStateSave(hass);
   } catch (err) {
     console.error('[smc] play failed:', err);
     return;
@@ -359,6 +365,7 @@ async function enqueueJfTracks(hass, eid, tracks) {
       added++;
     } catch { break; }
   }
+  if (added) scheduleStateSave(hass);
   return added;
 }
 
@@ -375,6 +382,7 @@ async function jumpToQueueTrack(hass, eid, track) {
     });
     _smcNowPlayingJfId = track.id;
     _smcNowPlayingJfAlbumId = track.albumId || null;
+    scheduleStateSave(hass);
   } catch (err) { console.error('[smc] jump failed:', err); }
 }
 
@@ -457,6 +465,7 @@ async function playYtmTrack(hass, eid, videoId, meta = {}, queue = null) {
       media_content_id: url,
       media_content_type: 'music',
     });
+    scheduleStateSave(hass);
     return true;
   } catch (err) {
     console.error('[smc] YTM play failed:', err);
@@ -485,6 +494,7 @@ async function enqueueYtmTrack(hass, eid, track) {
     });
     _ytmQueue.push(toYtmQueueItem(track));
     _ytmDirty = true;
+    scheduleStateSave(hass);
     return true;
   } catch (err) {
     console.error('[smc] YTM enqueue failed:', err);
@@ -1030,27 +1040,12 @@ function buildNpInfo(id, state, service = _smcService) {
     info.artist = _ytmNowPlaying?.artist || info.artist;
     info.art = _ytmNowPlaying?.thumbnail || info.art || null;
   } else {
-    // Jellyfin active: build cover art in explicit priority order. A non-null but
-    // 404ing HA entity_picture must NOT short-circuit the better sources, so the
-    // HA proxy is the LAST resort.
-    // Priority: known JF id → extract from stream URL → album fallback → HA proxy
-    if (!info.art && _smcNowPlayingJfId) {
-      info.art = jfNowPlayingArt();
-    }
-    if (!info.art && a.media_content_id) {
-      // Auto-detected track (not played from the card): extract the item ID from
-      // media_content_id, which carries the Jellyfin stream URL /Audio/{id}/stream.
-      // [a-f0-9-]+ handles both dashless and dashed GUIDs.
-      const m = a.media_content_id.match(/\/Audio\/([a-f0-9-]+)\/stream/i);
-      if (m && _jellyfinUrl && _jellyfinToken) {
-        info.art = `${_jellyfinUrl}/Items/${m[1]}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
-      }
-    }
-    if (!info.art && _smcNowPlayingJfAlbumId && _jellyfinUrl && _jellyfinToken) {
-      info.art = `${_jellyfinUrl}/Items/${_smcNowPlayingJfAlbumId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
-    }
-    // Queue imageTag fallback — the queue rows already have working art via
-    // jfImageUrl; if the above pipeline failed, use the same source.
+    // Jellyfin active. Tracks usually have NO track-level image — the cover lives
+    // on the album — so art resolution is album-first. The raw /Images/Primary
+    // track endpoint (no tag) 404s for those tracks, so we never use it.
+    // Priority: queue art → known album id → background-fetch album info → HA proxy
+
+    // 1. Queue item: album art when the track has no embedded image, else track art.
     if (!info.art && _smcNowPlayingJfId) {
       const qtrack = _smcQueue.find(t => t.id === _smcNowPlayingJfId);
       if (qtrack?.imageTag) {
@@ -1059,26 +1054,33 @@ function buildNpInfo(id, state, service = _smcService) {
         info.art = jfImageUrl(qtrack.albumId, null);
       }
     }
-    // Auto-detected track (queue empty after reload, so _smcNowPlayingJfId is
-    // null): extract the item id from media_content_id and confirm via the API
-    // that a Primary image exists, then register the id so the rest of the art
-    // pipeline treats it as known. Background fetch + _smcDirty re-render; the
-    // _smcLastFetchedArtId guard stops repeated fetches for the same item.
-    if (!_smcNowPlayingJfId && a.media_content_id) {
+
+    // 2. Known album id (set when the card plays a track) → album art via jfImageUrl.
+    if (!info.art && _smcNowPlayingJfAlbumId) {
+      info.art = jfImageUrl(_smcNowPlayingJfAlbumId, null);
+    }
+
+    // 3. Auto-detected track (not played from the card): extract the track id from
+    // media_content_id (/Audio/{id}/stream; [a-f0-9-]+ covers dashed + dashless
+    // GUIDs) and resolve its album id + tag in the background, then register them
+    // so the next render renders album art. _smcLastFetchedArtId guards against
+    // repeated fetches for the same item; _smcDirty triggers the re-render.
+    if (!info.art && a.media_content_id) {
       const m = a.media_content_id.match(/\/Audio\/([a-f0-9-]+)\/stream/i);
-      if (m) {
+      if (m && m[1] !== _smcLastFetchedArtId) {
         const extractedId = m[1];
-        if (_smcLastFetchedArtId !== extractedId) {
-          _smcLastFetchedArtId = extractedId;
-          jfFetchImageTag(extractedId).then(tag => {
-            if (tag) {
-              _smcNowPlayingJfId = extractedId;
-              _smcDirty = true;
-            }
-          });
-        }
+        _smcLastFetchedArtId = extractedId;
+        jfFetchTrackAlbumInfo(extractedId).then(result => {
+          if (result?.albumId) {
+            _smcNowPlayingJfId = extractedId;
+            _smcNowPlayingJfAlbumId = result.albumId;
+            _smcDirty = true;
+          }
+        });
       }
     }
+
+    // 4. Last resort: the HA proxy (usually null for native Sonos entities).
     if (!info.art) {
       info.art = smcResolveImage(a.entity_picture);
     }
@@ -1208,6 +1210,7 @@ async function ytmAdjacent(hass, entityId, delta) {
     await hass.callService('media_player', 'play_media', {
       entity_id: entityId, media_content_id: url, media_content_type: 'music',
     });
+    scheduleStateSave(hass);
   } catch (err) { console.error('[smc] YTM transport failed:', err); }
 }
 async function jfAdjacent(hass, entityId, delta) {
@@ -1222,6 +1225,7 @@ async function jfAdjacent(hass, entityId, delta) {
     });
     _smcNowPlayingJfId = track.id;
     _smcNowPlayingJfAlbumId = track.albumId || null;
+    scheduleStateSave(hass);
   } catch (err) { console.error('[smc] JF transport failed:', err); }
 }
 async function transportNext(hass, entityId) {
@@ -2070,6 +2074,7 @@ function QueueView({ hass, selectedSpeakers, onTabChange, service, onToast }) {
             } else {
               _smcQueue = []; _smcQueueEntityId = null; _smcNowPlayingJfId = null; _smcNowPlayingJfAlbumId = null; _smcLastFetchedArtId = null;
             }
+            scheduleStateSave(hass);
             force(n => n + 1);
           }}>Clear</button>
         </div>
@@ -2153,6 +2158,13 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
 
   const [currentPos, setCurrentPos] = useState(0);
 
+  // Art load failure as React state (not an imperative style.display='none', which
+  // Preact never undoes — it reconciles the same <img> node in place, so a stuck
+  // hide would survive a later valid src). Reset whenever the art URL changes so a
+  // new track gets a fresh attempt.
+  const [artError, setArtError] = useState(false);
+  useEffect(() => { setArtError(false); }, [np?.art]);
+
   // Real-time progress update
   useEffect(() => {
     if (!np) return;
@@ -2210,24 +2222,27 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
     }, 300);
   }, []);
 
-  // Grouped speakers for volume. Prefer the playing group's members; when nothing
-  // is grouped (or np is null) fall back to the selected speakers so every
-  // selected speaker still gets a slider.
+  // Volume sliders follow the CARD's selection (_smcSpeakers), not the HA/Sonos
+  // group_members of the playing entity. group_members reflects the real hardware
+  // group, which can include speakers the user never selected here (e.g. a
+  // household member grouping the living room for TV) — showing those as volume
+  // targets conflated two different things. A selected speaker running an external
+  // source (TV / line-in) gets a note instead of a slider rather than a control
+  // that wouldn't apply to music.
   const volumeSpeakers = useMemo(() => {
-    const eid = np?.entityId || selectedSpeakers[0] || null;
-    const ids = eid && hass?.states[eid]?.attributes?.group_members?.length
-      ? hass.states[eid].attributes.group_members
-      : selectedSpeakers;
-    return ids.map(id => {
-      const s = hass?.states[id];
+    if (!hass) return [];
+    return selectedSpeakers.map(id => {
+      const s = hass.states[id];
       return {
         id,
         name: s?.attributes?.friendly_name || id.replace('media_player.', ''),
         volume: s?.attributes?.volume_level != null
           ? Math.round(s.attributes.volume_level * 100) : 50,
+        isExternal: s ? isExternalSource(s) : false,
+        unavailable: !s || s.state === 'unavailable',
       };
     }).filter(sp => sp.id);
-  }, [hass, np, selectedSpeakers]);
+  }, [hass, selectedSpeakers]);
 
   // Nothing playing state
   if (!np) {
@@ -2244,17 +2259,11 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
 
   return html`
     <div class="np-scroll">
-      <!-- Album art (centered square) -->
-      ${np.art
+      <!-- Album art (centered square). Fallback to album art now happens in
+           buildNpInfo before render; onError just flips state to the placeholder. -->
+      ${np.art && !artError
         ? html`<img class="np-art-square" src=${np.art} alt="" loading="eager"
-            onError=${(e) => {
-              // Track-level art 404'd — fall back to album art once, then hide.
-              if (_smcNowPlayingJfAlbumId && _jellyfinUrl && !e.target.src.includes(_smcNowPlayingJfAlbumId)) {
-                e.target.src = `${_jellyfinUrl}/Items/${_smcNowPlayingJfAlbumId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
-              } else {
-                e.target.style.display = 'none';
-              }
-            }} />`
+            onError=${() => setArtError(true)} />`
         : html`<div class="np-art-square-placeholder"><${IconMusicNote} /></div>`
       }
 
@@ -2300,12 +2309,19 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
         <p class="np-volume-label">Volume · ${volumeSpeakers.length} speaker${volumeSpeakers.length !== 1 ? 's' : ''}</p>
         ${volumeSpeakers.map(sp => html`
           <div class="np-volume-row" key=${sp.id}>
-            <span class="np-volume-name">${sp.name}</span>
-            <input type="range" class="np-volume-slider" min="0" max="100" value=${sp.volume}
-              onInput=${(e) => handleVolume(sp.id, parseInt(e.target.value))}
-              style=${`background: linear-gradient(to right, ${THEME.primary} ${sp.volume}%, ${THEME.border} ${sp.volume}%)`}
-            />
-            <span class="np-volume-value">${sp.volume}</span>
+            <span class="np-volume-name" style=${sp.isExternal ? `color:${THEME.muted};` : ''}>
+              ${sp.name}${sp.isExternal ? ' (ext)' : ''}
+            </span>
+            ${sp.isExternal || sp.unavailable
+              ? html`<span style=${`flex:1;font-size:10px;color:${THEME.muted};`}>
+                  ${sp.isExternal ? 'External source' : 'Unavailable'}
+                </span>`
+              : html`<input type="range" class="np-volume-slider" min="0" max="100" value=${sp.volume}
+                  onInput=${(e) => handleVolume(sp.id, parseInt(e.target.value))}
+                  style=${`background: linear-gradient(to right, ${THEME.primary} ${sp.volume}%, ${THEME.border} ${sp.volume}%)`}
+                />`
+            }
+            <span class="np-volume-value">${sp.isExternal || sp.unavailable ? '' : sp.volume}</span>
           </div>
         `)}
       </div>
@@ -2326,6 +2342,11 @@ function BottomBar({ nowPlaying, hass, onTap }) {
   const hasTrack = !!np;
   const entityId = np?.entityId || null;
   const [currentPos, setCurrentPos] = useState(0);
+
+  // Art load failure as state (not imperative display:none, which Preact never
+  // restores on the reconciled <img> node). Reset when the art URL changes.
+  const [artError, setArtError] = useState(false);
+  useEffect(() => { setArtError(false); }, [np?.art]);
 
   // Real-time progress (mirrors NowPlayingView's clock).
   useEffect(() => {
@@ -2350,9 +2371,9 @@ function BottomBar({ nowPlaying, hass, onTap }) {
   return html`
     <div class="smc-bottom-bar" onClick=${onTap}>
       <div class="smc-bb-main">
-        ${np?.art
+        ${np?.art && !artError
           ? html`<img class="smc-bb-art" src=${np.art} alt="" loading="eager"
-              referrerpolicy="no-referrer" onError=${(e) => { e.target.style.display = 'none'; }} />`
+              referrerpolicy="no-referrer" onError=${() => setArtError(true)} />`
           : html`<div class="smc-bb-art-placeholder">
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
             </div>`
@@ -2431,6 +2452,70 @@ function storageSave(key, value) {
 function storageLoad(key) {
   if (!storageAvailable()) return null;
   try { return localStorage.getItem(key); } catch { return null; }
+}
+
+// ── Cross-device state via HA frontend user-data ─────────────────
+// localStorage is blocked by Edge tracking prevention in this HA context, so the
+// queue + service + now-playing live only in module memory and reset on every
+// load. HA's frontend/set_user_data + frontend/get_user_data store a JSON blob
+// server-side, scoped to the HA user — so the same user sees the same queue on a
+// Mac and a phone. No new infrastructure: it rides the WebSocket the card already
+// holds via hass.connection. Load-time restore (not real-time sync); saves are
+// debounced 2s so a burst of queue edits collapses into one write. Silently falls
+// back to in-memory behavior if the WS command is unavailable.
+const SMC_HA_KEY = 'sonos_music_card';
+let _smcHass = null;            // latest hass, for save hooks that lack a hass arg
+let _haStateSaveTimer = null;
+
+function buildStateBlob() {
+  return JSON.stringify({
+    v: 1,
+    service: _smcService,
+    smcQueue: _smcQueue,
+    smcQueueEntityId: _smcQueueEntityId,
+    ytmQueue: _ytmQueue,
+    ytmQueueEntityId: _ytmQueueEntityId,
+    ytmNowPlaying: _ytmNowPlaying,
+    smcNowPlayingJfId: _smcNowPlayingJfId,
+    smcNowPlayingJfAlbumId: _smcNowPlayingJfAlbumId,
+  });
+}
+
+function scheduleStateSave(hass) {
+  const h = hass || _smcHass;
+  if (!h?.connection?.sendMessagePromise) return;
+  if (_haStateSaveTimer) clearTimeout(_haStateSaveTimer);
+  _haStateSaveTimer = setTimeout(async () => {
+    _haStateSaveTimer = null;
+    try {
+      await h.connection.sendMessagePromise({
+        type: 'frontend/set_user_data', key: SMC_HA_KEY, value: buildStateBlob(),
+      });
+    } catch (e) { console.warn('[smc] state save failed:', e); }
+  }, 2000);
+}
+
+async function loadStateFromHA(hass) {
+  if (!hass?.connection?.sendMessagePromise) return;
+  try {
+    const result = await hass.connection.sendMessagePromise({
+      type: 'frontend/get_user_data', key: SMC_HA_KEY,
+    });
+    const blob = result?.value;
+    if (!blob) return;
+    const state = JSON.parse(blob);
+    if (!state || state.v !== 1) return;
+    if (state.service) _smcService = state.service;
+    if (Array.isArray(state.smcQueue)) _smcQueue = state.smcQueue;
+    if (state.smcQueueEntityId) _smcQueueEntityId = state.smcQueueEntityId;
+    if (Array.isArray(state.ytmQueue)) _ytmQueue = state.ytmQueue;
+    if (state.ytmQueueEntityId) _ytmQueueEntityId = state.ytmQueueEntityId;
+    if (state.ytmNowPlaying) _ytmNowPlaying = state.ytmNowPlaying;
+    if (state.smcNowPlayingJfId) _smcNowPlayingJfId = state.smcNowPlayingJfId;
+    if (state.smcNowPlayingJfAlbumId) _smcNowPlayingJfAlbumId = state.smcNowPlayingJfAlbumId;
+    _smcDirty = true;
+    console.log('[smc] state restored from HA:', state.smcQueue?.length || 0, 'jf,', state.ytmQueue?.length || 0, 'ytm');
+  } catch (e) { console.warn('[smc] state load failed:', e); }
 }
 
 function smcInit(hass) {
@@ -2609,7 +2694,7 @@ function SonosMusicApp({ hass, config }) {
 
   // Service toggle — mirror into module state so the views read it consistently,
   // and into React state so the panels re-render/re-fetch.
-  const setService = useCallback((s) => { _smcService = s; setServiceState(s); }, []);
+  const setService = useCallback((s) => { _smcService = s; setServiceState(s); scheduleStateSave(_smcHass); }, []);
 
   // One-at-a-time toast: shown, then auto-dismissed after 1.8s (the CSS animation
   // handles the fade; unmounting at the same time keeps only one toast alive).
@@ -2668,9 +2753,13 @@ class SonosMusicCard extends HTMLElement {
   constructor() { super(); this._hass = null; this._config = {}; this._initialized = false; }
   set hass(hass) {
     this._hass = hass;
+    _smcHass = hass;
     if (!this._initialized) {
       this._initialized = true;
       smcInit(hass);
+      // Rehydrate queue/service/now-playing from HA user-data (cross-device),
+      // then re-render once it resolves. Best-effort — no-ops if WS unavailable.
+      loadStateFromHA(hass).then(() => { if (this._root) this._renderApp(); });
       this._init();
     } else {
       // On every subsequent hass update, auto-detect any newly playing speaker

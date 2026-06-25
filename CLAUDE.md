@@ -152,13 +152,21 @@ let _smcService = 'jf'       // active service: 'jf' (Jellyfin) | 'ytm' — driv
 let _smcUserSelected = false // true after explicit user tap — blocks auto-detect
 let _smcUserSelectedAt = 0   // timestamp of last user tap
 let _smcDirty = false        // signals Preact to re-render after auto-detect change
+let _smcNowPlayingJfId = null      // current Jellyfin track id (for art)
+let _smcNowPlayingJfAlbumId = null // current Jellyfin album id — art is album-first (v0.20.0)
+let _smcQueue = []           // card-side Jellyfin queue [{id,name,subtitle,imageTag,albumId}]
+let _ytmQueue = []           // card-side YTM queue
+let _smcHass = null          // latest hass, for state-save hooks lacking a hass arg (v0.20.0)
+let _haStateSaveTimer = null // debounce timer for HA user-data save (v0.20.0)
 ```
 
 ### Key functions
 | Function | Purpose |
 |---|---|
-| `smcInit(hass)` | Cold load. Seeds `_smcSpeakers` from playing state or localStorage |
+| `smcInit(hass)` | Cold load. Seeds `_smcSpeakers` from playing state or localStorage. On first `set hass` the card also calls `loadStateFromHA` to rehydrate queue/service/now-playing (v0.20.0) |
 | `smcAutoDetect(hass)` | Every hass update. Promotes a playing speaker if nothing selected |
+| `loadStateFromHA(hass)` / `scheduleStateSave(hass)` / `buildStateBlob()` | Cross-device state (v0.20.0). Persist `service` + both queues + now-playing ids to HA `frontend/set_user_data` (key `sonos_music_card`) over the existing WebSocket; load on init. Save is debounced 2s and called at every queue/service/now-playing mutation. Silent in-memory fallback if `hass.connection.sendMessagePromise` is unavailable |
+| `jfFetchTrackAlbumInfo(trackId)` | (v0.20.0, replaces `jfFetchImageTag`) Fetch `AlbumId` + `AlbumPrimaryImageTag` for a track in one `/Items?Ids=…&Fields=…` call — used to resolve **album** art for auto-detected tracks, since most tracks have no track-level image |
 | `smcToggleSpeaker(entityId, hass)` | Chip toggle = group membership (clean on/off, v0.19.0). Add → simple `join` to the active coordinator if something's playing, else just select; remove → `unjoin` (stops). Removing the **last** speaker is playback-conditional (v0.19.5): if it's playing, `media_stop` first, then deselect to zero; if idle, just deselect to zero. Async; `_smcSpeakers` mutates synchronously for optimistic UI. Sets `_smcUserSelected = true` |
 | `transportPlayPause/Next/Prev(hass, entityId)` | Shared transport (v0.19.0) used by both BottomBar and NowPlayingView. Play/pause → HA `media_play_pause`. Next/prev resolve the adjacent queue track card-side and `play_media` it when the active service has a card-side queue — YTM via `ytmAdjacent`/`_ytmQueue`, Jellyfin via `jfAdjacent`/`_smcQueue` (v0.19.1; HA `media_next_track` no-ops on native Sonos entities queued via `play_media`). Falls back to HA `media_*` services when the queue is empty |
 | `hasMediaContext(state)` | True if playing, paused, or idle+title+mid-track |
@@ -186,7 +194,11 @@ function isExternalSource(state) {
   `/Users` (prefer an administrator). `jellyfin_user_id` config overrides.
 - Browse tree: music libraries (`/Users/{uid}/Views`, `CollectionType==music`)
   → Artists / Albums / Playlists → artist albums → album tracks → tap to play.
-- Images: `/Items/{id}/Images/Primary` (public, no token).
+- Images: `/Items/{id}/Images/Primary` (public, no token). **Art is album-first**
+  (v0.20.0): most tracks have no track-level image, so `/Items/{trackId}/Images/Primary`
+  404s — the cover lives on the album. Resolve `AlbumId` and render
+  `jfImageUrl(albumId)`. Track-level art is used only when a track genuinely carries
+  its own `ImageTags.Primary`.
 - Stream URL (speaker-facing, internal base): `/Audio/{id}/stream.mp3?api_key=…&audioCodec=mp3`.
 
 ### Playback
@@ -258,6 +270,30 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.20.0** — Three fixes.
+1. **Art pipeline rewritten album-first.** Empirically, most tracks have **no
+   track-level image** — the cover lives on the album, so the raw
+   `/Items/{trackId}/Images/Primary` endpoint 404s regardless of params or token.
+   `buildNpInfo` now resolves album art via `jfImageUrl(albumId)`;
+   `jfFetchTrackAlbumInfo` (replaces `jfFetchImageTag`) fetches `AlbumId` +
+   `AlbumPrimaryImageTag` in one call for auto-detected tracks, registers
+   `_smcNowPlayingJfAlbumId`, and `_smcDirty`-re-renders. A known-404 track URL no
+   longer pre-empts the working album fallback. The NP/BottomBar `<img>` no longer
+   hides itself with an imperative `style.display='none'` (which Preact never
+   restored on the reconciled node, so a later valid src stayed hidden) — load
+   failure is an `artError` state flag that resets when the art URL changes.
+2. **Volume sliders follow the card's selection.** `volumeSpeakers` now derives
+   from `_smcSpeakers` (what the user chose), not the playing entity's HA
+   `group_members` (the real Sonos group), so an unrelated group — e.g. a household
+   member grouping the living room for TV — no longer appears as a volume target.
+   A selected speaker on an external source (TV/line-in) or unavailable shows a
+   note instead of a slider.
+3. **Cross-device queue persistence.** `service` + both queues + now-playing ids
+   persist via HA `frontend/{get,set}_user_data` over the existing WebSocket —
+   per-user, cross-device, cross-browser, **no new infrastructure** (localStorage is
+   blocked by Edge tracking prevention here). Load-time restore on init; debounced
+   2s save on every mutation; silent in-memory fallback if the WS command is absent.
+
 **v0.19.6** — **Save as Playlist** in the Queue tab (Jellyfin only — the button is
 hidden when `_smcService === 'ytm'`). The queue-count row gained a **Save as
 playlist** button next to **Clear**; tapping it opens an inline name input
@@ -371,10 +407,11 @@ id via `jfImageUrl` if `imageTag` is absent), before falling back to the HA prox
    drag event (module-level `_volumeDebounceTimer`) instead of on every onInput,
    so dragging no longer floods HA.
 
-Known limitation: the queue + YTM now-playing do **not** persist across a card
-reload — `localStorage` is blocked by Edge/Chromium tracking prevention in this
-HA environment (see the safe storage wrapper, v0.17.2), so both are in-memory by
-design. Intentionally not implemented, not a bug.
+Known limitation (resolved in v0.20.0): at this version the queue + YTM
+now-playing did **not** persist across a card reload — `localStorage` is blocked
+by Edge/Chromium tracking prevention in this HA environment (see the safe storage
+wrapper, v0.17.2). v0.20.0 added cross-device persistence via HA user-data over
+the WebSocket, which sidesteps the localStorage block.
 
 **v0.17.4** — Jellyfin now-playing art for **auto-detected tracks** (a track
 already playing when the card loads, not launched from the card, so
@@ -550,10 +587,11 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [x] Persistent transport on every tab (BottomBar replaces MiniPlayer) — v0.19.0
 - [x] Speaker chip model simplified (clean join/unjoin, no rejoin dance) — v0.19.0
 - [x] Album thumbnails in Browse (maxHeight/maxWidth + imageTag audit) — v0.19.0
-- [~] Queue + YTM now-playing persistence across reload — **intentionally not
-  implemented**: `localStorage` is blocked by Edge/Chromium tracking prevention in
-  this HA/Edge environment, so card-side queue + `_ytmNowPlaying` are in-memory by
-  design (see the v0.17.2 safe storage wrapper). Not a bug.
+- [x] Queue + YTM now-playing persistence across reload **and across devices** —
+  v0.20.0 via HA `frontend/{get,set}_user_data` over the existing WebSocket
+  (per-user, cross-device). Supersedes the prior "intentionally not implemented"
+  stance: `localStorage` was the blocker (Edge tracking prevention), and HA
+  user-data sidesteps it with no new infrastructure.
 
 ## Session startup checklist
 1. Read this file (`cat ~/code/sonos-music-card/CLAUDE.md`)
