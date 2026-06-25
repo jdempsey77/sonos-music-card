@@ -270,6 +270,8 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.21.3** — Sonos favorite **thumbnails**. `smcResolveImage` upgrades `http://` art to `https://` when the card is served over HTTPS (an http img on an https page is silently blocked as mixed content; tunein/googleusercontent serve both schemes), and favorite rows fall back to the ♪ placeholder on img `onError`. Note: several Sonos favorites point at expired/ephemeral service art (e.g. `sonos.plex.tv` proxy links that 500, stale `googleusercontent` art that 404s) — those can't be recovered client-side and show the placeholder.
+
 **v0.21.2** — Bug fix: Sonos favorites now render. `browse_media` in this HA build is a **lazy tree** — each node returns `can_expand:true` with no `children` array, so `sonosFetchFavorites` now fetches every level explicitly (root → Favorites node → each category folder), one `sonosBrowse` per level, instead of a single drill that silently dropped folders. Debug `console.log`s removed from `sonosBrowse`.
 
 **v0.21.0** — **Sonos favorites as a third service.** A green **Sonos** pill joins

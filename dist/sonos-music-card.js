@@ -1,4 +1,4 @@
-// Sonos Music Card v0.21.2
+// Sonos Music Card v0.21.3
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -82,6 +82,13 @@
 // -> each category folder with a separate sonosBrowse per level (was: single drill +
 // parseBrowseMediaResult, which silently dropped folders whose children weren't
 // inlined). Debug console.log lines removed from sonosBrowse (console.warn kept).
+// v0.21.3: Sonos favorite thumbnails. (a) smcResolveImage now upgrades http:// art
+// to https:// when the card is served over HTTPS — an http img on an https page is
+// silently blocked (mixed content); CDNs like tunein/googleusercontent serve both.
+// (b) Favorite rows fall back to the ♪ placeholder on img onError, so art that 404s
+// or 500s upstream (some Sonos favorites point at expired/ephemeral service URLs —
+// e.g. sonos.plex.tv proxy links, stale googleusercontent art) shows the placeholder
+// instead of a broken-image icon. Dead upstream URLs can't be recovered client-side.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -1200,7 +1207,15 @@ const cardStyles = `
 // (e.g. /api/media_player_proxy/...) that needs location.origin prepended.
 function smcResolveImage(url) {
   if (!url) return null;
-  return url.startsWith('http') ? url : `${location.origin}${url}`;
+  if (url.startsWith('//')) return `${location.protocol}${url}`;
+  if (!url.startsWith('http')) return `${location.origin}${url}`;
+  // Avoid mixed-content blocking: when the card is served over HTTPS, upgrade
+  // http:// image URLs to https:// (image CDNs like tunein/googleusercontent serve
+  // both schemes; an http img on an https page is silently blocked by the browser).
+  if (location.protocol === 'https:' && url.startsWith('http://')) {
+    return `https://${url.slice(7)}`;
+  }
+  return url;
 }
 
 // Build now-playing info for a speaker, scoped to the active service. The service
@@ -2202,6 +2217,7 @@ function SonosBrowseView({ hass, selectedSpeakers, onTabChange, onToast }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [playingId, setPlayingId] = useState(null);
+  const [broken, setBroken] = useState(() => new Set());
   const hassRef = useRef(hass);
   hassRef.current = hass;
   const eid = selectedSpeakers[0]; // coordinator
@@ -2249,9 +2265,10 @@ function SonosBrowseView({ hass, selectedSpeakers, onTabChange, onToast }) {
           ${folder.items.map(item => html`
             <div key=${item.mediaContentId} class="smc-browse-row"
               onClick=${() => playFavorite(item)}>
-              ${item.thumbnail
+              ${item.thumbnail && !broken.has(item.mediaContentId)
                 ? html`<img class="smc-browse-thumb" src=${item.thumbnail}
-                    alt="" loading="eager" referrerpolicy="no-referrer" />`
+                    alt="" loading="eager" referrerpolicy="no-referrer"
+                    onError=${() => setBroken(b => { const n = new Set(b); n.add(item.mediaContentId); return n; })} />`
                 : html`<div class="smc-browse-thumb-placeholder">♪</div>`
               }
               <div class="smc-browse-info">
