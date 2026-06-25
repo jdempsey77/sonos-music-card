@@ -159,7 +159,7 @@ let _smcDirty = false        // signals Preact to re-render after auto-detect ch
 |---|---|
 | `smcInit(hass)` | Cold load. Seeds `_smcSpeakers` from playing state or localStorage |
 | `smcAutoDetect(hass)` | Every hass update. Promotes a playing speaker if nothing selected |
-| `smcToggleSpeaker(entityId, hass)` | Chip toggle = group membership (clean on/off, v0.19.0). Add → simple `join` to the active coordinator if something's playing, else just select; remove → `unjoin` (stops). Last speaker can't be removed. Async; `_smcSpeakers` mutates synchronously for optimistic UI. Sets `_smcUserSelected = true` |
+| `smcToggleSpeaker(entityId, hass)` | Chip toggle = group membership (clean on/off, v0.19.0). Add → simple `join` to the active coordinator if something's playing, else just select; remove → `unjoin` (stops). Removing the **last** speaker is playback-conditional (v0.19.5): if it's playing, `media_stop` first, then deselect to zero; if idle, just deselect to zero. Async; `_smcSpeakers` mutates synchronously for optimistic UI. Sets `_smcUserSelected = true` |
 | `transportPlayPause/Next/Prev(hass, entityId)` | Shared transport (v0.19.0) used by both BottomBar and NowPlayingView. Play/pause → HA `media_play_pause`. Next/prev resolve the adjacent queue track card-side and `play_media` it when the active service has a card-side queue — YTM via `ytmAdjacent`/`_ytmQueue`, Jellyfin via `jfAdjacent`/`_smcQueue` (v0.19.1; HA `media_next_track` no-ops on native Sonos entities queued via `play_media`). Falls back to HA `media_*` services when the queue is empty |
 | `hasMediaContext(state)` | True if playing, paused, or idle+title+mid-track |
 | `isExternalSource(state)` | True if playing from a non-queue source (TV, line-in) |
@@ -258,6 +258,17 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.19.5** — Last-speaker chip guard is now **playback-conditional**. Tapping the
+only selected chip used to be a no-op (the guard blocked deselect outright). Now:
+tapping it while **idle** deselects to zero (the card shows "Select a speaker
+first" — all views already handle the empty selection and every `play_media` path
+early-returns on `!eid`); tapping it while **playing** issues `media_stop` on that
+speaker first, then deselects to zero. Both paths fall through to the existing 30s
+`_smcUserSelected` latch, so `smcAutoDetect` won't immediately re-promote a playing
+speaker and silently undo the deselect. Deferred: coordinator handoff when the
+`[0]` speaker is removed from a group, and pruning offline/unavailable speakers
+from `_smcSpeakers`.
+
 **v0.19.4** — Clear queue button in the Queue tab. The queue-count row gained a
 right-aligned **Clear** button: it empties the active service's card-side queue
 (`_ytmQueue`/`_ytmQueueEntityId` + `_ytmNowPlaying` when YTM, else `_smcQueue`/

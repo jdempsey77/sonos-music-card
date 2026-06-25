@@ -1,4 +1,4 @@
-// Sonos Music Card v0.19.4
+// Sonos Music Card v0.19.5
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -2445,13 +2445,27 @@ async function smcToggleSpeaker(entityId, hass) {
   const isSelected = _smcSpeakers.includes(entityId);
 
   if (isSelected) {
-    // Cannot remove last speaker
-    if (_smcSpeakers.length <= 1) return;
-    // Unjoin — stops playback on this speaker
-    _smcSpeakers = _smcSpeakers.filter(id => id !== entityId);
-    try {
-      await hass.callService('media_player', 'unjoin', { entity_id: entityId });
-    } catch (err) { console.error('[smc] unjoin failed:', err); }
+    if (_smcSpeakers.length <= 1) {
+      // Last selected speaker — deselect to zero. The guard used to block this
+      // outright; now it's playback-conditional. If this speaker is playing,
+      // stop its audio first so we don't strand sound with no on-screen target;
+      // if idle, just clear. Downstream views already handle the empty selection
+      // ("Select a speaker first"). The latch block below STILL runs on this
+      // path, so smcAutoDetect won't immediately re-promote a playing speaker
+      // and silently undo the deselect.
+      if (hass?.states[entityId]?.state === 'playing') {
+        try {
+          await hass.callService('media_player', 'media_stop', { entity_id: entityId });
+        } catch (err) { console.error('[smc] stop failed:', err); }
+      }
+      _smcSpeakers = [];
+    } else {
+      // Unjoin — stops playback on this speaker
+      _smcSpeakers = _smcSpeakers.filter(id => id !== entityId);
+      try {
+        await hass.callService('media_player', 'unjoin', { entity_id: entityId });
+      } catch (err) { console.error('[smc] unjoin failed:', err); }
+    }
   } else {
     // Add to selection
     _smcSpeakers = [..._smcSpeakers, entityId];
