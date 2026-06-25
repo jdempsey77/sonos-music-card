@@ -1,4 +1,4 @@
-// Sonos Music Card v0.19.1
+// Sonos Music Card v0.19.2
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -1009,6 +1009,16 @@ function buildNpInfo(id, state, service = _smcService) {
     }
     if (!info.art && _smcNowPlayingJfAlbumId && _jellyfinUrl && _jellyfinToken) {
       info.art = `${_jellyfinUrl}/Items/${_smcNowPlayingJfAlbumId}/Images/Primary?api_key=${encodeURIComponent(_jellyfinToken)}`;
+    }
+    // Queue imageTag fallback — the queue rows already have working art via
+    // jfImageUrl; if the above pipeline failed, use the same source.
+    if (!info.art && _smcNowPlayingJfId) {
+      const qtrack = _smcQueue.find(t => t.id === _smcNowPlayingJfId);
+      if (qtrack?.imageTag) {
+        info.art = jfImageUrl(_smcNowPlayingJfId, qtrack.imageTag);
+      } else if (qtrack?.albumId) {
+        info.art = jfImageUrl(qtrack.albumId, null);
+      }
     }
     if (!info.art) {
       info.art = smcResolveImage(a.entity_picture);

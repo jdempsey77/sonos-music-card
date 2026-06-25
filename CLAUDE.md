@@ -258,6 +258,12 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.19.2** — Now Playing art uses the queue's `imageTag` as a fallback. When the
+Jellyfin art pipeline (known JF id → stream-URL extract → album fallback) all miss,
+`buildNpInfo` now looks up the current track in `_smcQueue` by id and reuses the same
+`jfImageUrl(id, imageTag)` source the queue rows already render successfully (album
+id via `jfImageUrl` if `imageTag` is absent), before falling back to the HA proxy.
+
 **v0.19.1** — Jellyfin next/prev card-side queue navigation (`jfAdjacent` mirrors `ytmAdjacent`).
 
 **v0.19.0** — Persistent bottom bar, speaker chip overhaul, album thumbnail fix.
@@ -484,6 +490,7 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [x] Jellyfin now-playing art 404 (prefer `jfNowPlayingArt()` over HA proxy) — v0.17.2
 - [x] Jellyfin now-playing art album fallback (track has no Primary image) — v0.17.3
 - [x] Jellyfin art for auto-detected tracks (extract item ID from media_content_id) — v0.17.4
+- [x] Now Playing art queue imageTag fallback (reuse working queue-row art) — v0.19.2
 - [x] localStorage tracking-prevention console spam — v0.17.2 (safe storage wrapper)
 - [x] Auto-detect oscillation between two playing speakers (latch) — v0.18.0
 - [x] Render-phase side effects / impure `getNowPlaying` (moved to effects) — v0.18.0
