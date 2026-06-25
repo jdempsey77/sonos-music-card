@@ -270,6 +270,8 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.21.2** — Bug fix: Sonos favorites now render. `browse_media` in this HA build is a **lazy tree** — each node returns `can_expand:true` with no `children` array, so `sonosFetchFavorites` now fetches every level explicitly (root → Favorites node → each category folder), one `sonosBrowse` per level, instead of a single drill that silently dropped folders. Debug `console.log`s removed from `sonosBrowse`.
+
 **v0.21.0** — **Sonos favorites as a third service.** A green **Sonos** pill joins
 Jellyfin and YTM in the `ServiceBar` (`_smcService` now `'jf' | 'ytm' | 'sonos'`).
 Selecting it shows `SonosBrowseView` under the Browse tab: a single
@@ -292,10 +294,11 @@ Implementation notes:
 - `sonosFetchFavorites(hass, eid)` → `sonosBrowse` (primary: `hass.callService(...,
   returnResponse=true)` positional signature; fallback: `hass.callWS` browse_media,
   absent in this HA build). The Sonos media root holds a **Favorites** node whose
-  children are the category folders, so the fetch drills into that node if the root
-  isn't already the favorites tree, then `parseBrowseMediaResult` groups can-expand
-  children into folders of their `can_play` leaves (thumbnails via `smcResolveImage`;
-  empty folders dropped).
+  children are the category folders. `browse_media` is a **lazy tree** (each node
+  returns `can_expand` with no children inlined), so v0.21.2 fetches every level
+  explicitly: root → Favorites node → each category folder, one `sonosBrowse` per
+  level, then collects each folder's `can_play` leaves (thumbnails via
+  `smcResolveImage`; empty folders dropped).
 - Browse-tab routing in `SonosMusicApp`: `sonosBrowseVisible` / `sonosSearchVisible`
   mirror the JF/YTM panel-visibility flags; all panels stay mounted (CSS-hidden).
 

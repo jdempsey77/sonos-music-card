@@ -1,4 +1,4 @@
-// Sonos Music Card v0.21.1
+// Sonos Music Card v0.21.2
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -76,6 +76,12 @@
 // search); the Queue tab shows "Sonos manages its own queue". Now Playing is
 // unchanged — buildNpInfo reads HA state, and radio favorites surface the existing
 // external-source message (correct). Existing JF/YTM code paths are untouched.
+// v0.21.2: fix Sonos favorites not rendering — browse_media in this HA build is a
+// LAZY tree: each node returns can_expand:true but no children array, so every
+// level must be fetched explicitly. sonosFetchFavorites now drills root -> Favorites
+// -> each category folder with a separate sonosBrowse per level (was: single drill +
+// parseBrowseMediaResult, which silently dropped folders whose children weren't
+// inlined). Debug console.log lines removed from sonosBrowse (console.warn kept).
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -615,7 +621,6 @@ async function sonosBrowse(hass, entityId, contentId, contentType) {
   try {
     const result = await hass.callService('media_player', 'browse_media', data, undefined, false, true);
     const root = result?.response ?? result;
-    console.log('[smc] browse_media callService result:', JSON.stringify(root)?.slice(0, 200));
     if (root && (root.children || root.can_expand)) return root;
   } catch (err) {
     console.warn('[smc] browse_media callService failed:', err);
@@ -628,7 +633,6 @@ async function sonosBrowse(hass, entityId, contentId, contentType) {
         media_content_id: contentId,
         media_content_type: contentType,
       });
-      console.log('[smc] browse_media WS result:', JSON.stringify(wsResult)?.slice(0, 200));
       return wsResult;
     } else {
       console.warn('[smc] hass.callWS not available');
@@ -641,22 +645,77 @@ async function sonosBrowse(hass, entityId, contentId, contentType) {
 }
 
 // Fetch Sonos favorites grouped by folder. Re-fetches every call — never cache
-// (favorite_item_ids are volatile). The Sonos media root contains a "Favorites"
-// node whose children are the category folders; if the root we get back already
-// IS that favorites tree (children are categories with playable leaves), we parse
-// it directly, otherwise we drill into the Favorites node first.
+// (favorite_item_ids are volatile). browse_media in this HA build is a LAZY tree:
+// each node comes back with can_expand:true but NO children array, so every level
+// must be fetched explicitly. We drill root -> Favorites node -> each category
+// folder (Radio/Playlists/Albums/…), issuing a separate sonosBrowse per level, and
+// collect each folder's can_play leaves.
 async function sonosFetchFavorites(hass, entityId) {
   if (!hass || !entityId) return [];
+
+  // Step 1: fetch root
   const root = await sonosBrowse(hass, entityId);
   if (!root) return [];
-  let tree = root;
-  const favNode = (root.children || []).find(c =>
+
+  // Step 2: find Favorites node — may need explicit fetch to get children
+  let favNode = (root.children || []).find(c =>
     c.media_content_type === 'favorites' || /favorit/i.test(c.title || ''));
-  if (favNode && favNode.can_expand) {
-    const favTree = await sonosBrowse(hass, entityId, favNode.media_content_id, favNode.media_content_type);
-    if (favTree) tree = favTree;
+
+  // If root has no children (lazy tree), fetch root children explicitly
+  if (!favNode && root.can_expand) {
+    const rootExpanded = await sonosBrowse(hass, entityId, root.media_content_id || '', root.media_content_type || 'root');
+    favNode = (rootExpanded?.children || []).find(c =>
+      c.media_content_type === 'favorites' || /favorit/i.test(c.title || ''));
+    // If still no children, the expanded root IS the favorites tree
+    if (!favNode && rootExpanded?.children?.length) {
+      return parseBrowseMediaResult(rootExpanded);
+    }
   }
-  return parseBrowseMediaResult(tree);
+
+  if (!favNode) return [];
+
+  // Step 3: fetch Favorites node children explicitly
+  const favExpanded = await sonosBrowse(hass, entityId, favNode.media_content_id, favNode.media_content_type);
+  if (!favExpanded) return [];
+
+  // Step 4: for each folder (Radio/Playlists/etc), fetch its children explicitly
+  const folders = [];
+  const topChildren = favExpanded.children || [];
+
+  // If no children at this level, try parsing directly
+  if (!topChildren.length && favExpanded.can_expand) {
+    return parseBrowseMediaResult(favExpanded);
+  }
+
+  for (const folder of topChildren) {
+    if (!folder.can_expand && !folder.can_play) continue;
+    if (folder.can_play) {
+      // Top-level playable item
+      let misc = folders.find(f => f.folder === 'Favorites');
+      if (!misc) { misc = { folder: 'Favorites', items: [] }; folders.push(misc); }
+      misc.items.push({
+        title: folder.title,
+        thumbnail: smcResolveImage(folder.thumbnail) || null,
+        mediaContentId: folder.media_content_id,
+        mediaContentType: folder.media_content_type || 'favorite_item_id',
+      });
+      continue;
+    }
+    // Fetch folder children explicitly
+    const folderExpanded = await sonosBrowse(hass, entityId, folder.media_content_id, folder.media_content_type);
+    const items = (folderExpanded?.children || [])
+      .filter(i => i.can_play)
+      .map(i => ({
+        title: i.title,
+        thumbnail: smcResolveImage(i.thumbnail) || null,
+        mediaContentId: i.media_content_id,
+        mediaContentType: i.media_content_type || 'favorite_item_id',
+      }));
+    if (items.length) {
+      folders.push({ folder: folder.title, items });
+    }
+  }
+  return folders;
 }
 
 // Play a Sonos favorite on the coordinator. Sonos favorites replace current
