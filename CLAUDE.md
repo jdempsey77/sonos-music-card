@@ -258,6 +258,14 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.19.4** — Clear queue button in the Queue tab. The queue-count row gained a
+right-aligned **Clear** button: it empties the active service's card-side queue
+(`_ytmQueue`/`_ytmQueueEntityId` + `_ytmNowPlaying` when YTM, else `_smcQueue`/
+`_smcQueueEntityId` + the now-playing art ids `_smcNowPlayingJfId`/
+`_smcNowPlayingJfAlbumId`/`_smcLastFetchedArtId`) and bumps QueueView's local
+`force` counter to re-render. Audio already playing on the speaker is unaffected —
+this only clears the card-side list.
+
 **v0.19.3** — Three fixes.
 1. **Now Playing art for auto-detected tracks** — when `_smcNowPlayingJfId` is
    null and `_smcQueue` is empty (e.g. after a reload), `buildNpInfo` extracts the
@@ -511,6 +519,7 @@ no public repo). Host-specific addresses live in private `d5-automation`.
 - [x] Now Playing art for auto-detected tracks via direct API imageTag fetch — v0.19.3
 - [x] Browse defaults to library level (auto-advance past root) — v0.19.3
 - [x] Smart tap on album/playlist rows (play-all when idle, drill when playing) — v0.19.3
+- [x] Clear queue button in Queue tab — v0.19.4
 - [x] localStorage tracking-prevention console spam — v0.17.2 (safe storage wrapper)
 - [x] Auto-detect oscillation between two playing speakers (latch) — v0.18.0
 - [x] Render-phase side effects / impure `getNowPlaying` (moved to effects) — v0.18.0

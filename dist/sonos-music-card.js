@@ -1,4 +1,4 @@
-// Sonos Music Card v0.19.3
+// Sonos Music Card v0.19.4
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -2030,7 +2030,17 @@ function QueueView({ hass, selectedSpeakers, onTabChange, service }) {
 
   return html`
     <div class="smc-content">
-      <p class="smc-queue-count">${queue.length} track${queue.length !== 1 ? 's' : ''}</p>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin:0 0 8px 4px;">
+        <p class="smc-queue-count" style="margin:0;">${queue.length} track${queue.length !== 1 ? 's' : ''}</p>
+        <button class="smc-action-btn" onClick=${() => {
+          if (_smcService === 'ytm') {
+            _ytmQueue = []; _ytmQueueEntityId = null; _ytmNowPlaying = null; _ytmDirty = true;
+          } else {
+            _smcQueue = []; _smcQueueEntityId = null; _smcNowPlayingJfId = null; _smcNowPlayingJfAlbumId = null; _smcLastFetchedArtId = null;
+          }
+          force(n => n + 1);
+        }}>Clear</button>
+      </div>
       <div class="smc-browse-list">
         ${queue.map((q, i) => {
           const cur = isCurrent(q);
