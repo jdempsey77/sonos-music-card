@@ -1,4 +1,4 @@
-// Sonos Music Card v0.21.0
+// Sonos Music Card v0.21.1
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -615,22 +615,28 @@ async function sonosBrowse(hass, entityId, contentId, contentType) {
   try {
     const result = await hass.callService('media_player', 'browse_media', data, undefined, false, true);
     const root = result?.response ?? result;
+    console.log('[smc] browse_media callService result:', JSON.stringify(root)?.slice(0, 200));
     if (root && (root.children || root.can_expand)) return root;
   } catch (err) {
     console.warn('[smc] browse_media callService failed:', err);
   }
   try {
     if (hass.callWS) {
-      return await hass.callWS({
+      const wsResult = await hass.callWS({
         type: 'media_player/browse_media',
         entity_id: entityId,
         media_content_id: contentId,
         media_content_type: contentType,
       });
+      console.log('[smc] browse_media WS result:', JSON.stringify(wsResult)?.slice(0, 200));
+      return wsResult;
+    } else {
+      console.warn('[smc] hass.callWS not available');
     }
   } catch (err) {
     console.warn('[smc] browse_media WS failed:', err);
   }
+  console.warn('[smc] browse_media both paths failed for', entityId, contentId);
   return null;
 }
 
