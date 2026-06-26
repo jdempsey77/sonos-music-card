@@ -1,4 +1,4 @@
-// Sonos Music Card v0.21.5
+// Sonos Music Card v0.21.6
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -705,7 +705,7 @@ async function sonosFetchFavorites(hass, entityId) {
   }
 
   for (const folder of topChildren) {
-    if (!folder.can_expand && !folder.can_play) continue;
+    if (!folder.can_expand && !folder.can_play && folder.media_content_type !== 'favorites_folder') continue;
     if (folder.can_play) {
       // Top-level playable item
       let misc = folders.find(f => f.folder === 'Favorites');
