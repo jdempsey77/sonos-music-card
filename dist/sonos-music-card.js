@@ -1,4 +1,4 @@
-// Sonos Music Card v0.21.3
+// Sonos Music Card v0.21.4
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -89,6 +89,16 @@
 // or 500s upstream (some Sonos favorites point at expired/ephemeral service URLs —
 // e.g. sonos.plex.tv proxy links, stale googleusercontent art) shows the placeholder
 // instead of a broken-image icon. Dead upstream URLs can't be recovered client-side.
+// v0.21.4: (a) Refresh-loop fix — the dirty-flag useEffect had no dependency array,
+// so it ran after every render; when _smcDirty triggered forceUpdate the next render
+// re-ran it, and the art fetch re-setting _smcDirty closed a render->dirty->render
+// loop. Now a single setInterval(500ms) polls the flags, breaking the cycle while
+// still picking up auto-detect / YTM metadata changes promptly. (b) Sonos Browse
+// showing the Jellyfin tree — loadStateFromHA restores _smcService async after the
+// first render, but useState only reads its initial value once; a module-level
+// _smcSetService ref lets loadStateFromHA sync the React service state immediately
+// on restore. (c) Queue tab hidden when Sonos is active (Sonos owns its queue);
+// switching to Sonos while on Queue auto-redirects to Browse.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -2714,11 +2724,12 @@ function BottomBar({ nowPlaying, hass, onTap }) {
 }
 
 // ── Bottom Nav ──────────────────────────────────────────────────
-function BottomNav({ activeTab, onTabChange }) {
+function BottomNav({ activeTab, onTabChange, service }) {
   const tabs = [
     { id: 'search', label: 'Search', icon: IconSearch },
     { id: 'browse', label: 'Browse', icon: IconBrowse },
-    { id: 'queue', label: 'Queue', icon: IconQueue },
+    // Sonos manages its own queue — the Queue tab is meaningless there, so hide it.
+    ...(service !== 'sonos' ? [{ id: 'queue', label: 'Queue', icon: IconQueue }] : []),
     { id: 'playing', label: 'Now Playing', icon: IconNowPlaying },
   ];
   return html`
@@ -2739,6 +2750,7 @@ const SMC_KEY = 'smc_selected_speakers';
 let _smcSpeakers = []; // THE selected speakers — single source of truth
 let _smcDirty = false; // set when smcAutoDetect changes _smcSpeakers
 let _ytmDirty = false; // set when _ytmNowPlaying changes — signals Preact to re-render
+let _smcSetService = null; // React service setter — registered on mount so loadStateFromHA can sync restored service
 let _smcUserSelected = false; // true after explicit user tap — blocks auto-detect
 let _smcUserSelectedAt = 0; // timestamp of last user tap
 
@@ -2814,7 +2826,10 @@ async function loadStateFromHA() {
     if (!r.ok) return;
     const state = await r.json();
     if (!state || state.v !== 1) return;
-    if (state.service) _smcService = state.service;
+    if (state.service) {
+      _smcService = state.service;
+      if (_smcSetService) _smcSetService(state.service);
+    }
     if (Array.isArray(state.smcQueue) && state.smcQueue.length) _smcQueue = state.smcQueue;
     if (state.smcQueueEntityId) _smcQueueEntityId = state.smcQueueEntityId;
     if (Array.isArray(state.ytmQueue) && state.ytmQueue.length) _ytmQueue = state.ytmQueue;
@@ -2959,20 +2974,32 @@ function SonosMusicApp({ hass, config }) {
   // Force re-render counter — bumped when user taps a speaker
   const [, forceUpdate] = useState(0);
 
+  // Register the React service setter at module level so loadStateFromHA can sync
+  // the restored service into React state once its async load completes (useState
+  // only reads its initial value once, so a post-mount restore would otherwise be
+  // ignored and the wrong service's Browse view would show).
+  useEffect(() => {
+    _smcSetService = setServiceState;
+    return () => { _smcSetService = null; };
+  }, []);
+
   // Sync module-level dirty flags (auto-detect speaker change, YTM now-playing
   // change) into the Preact render cycle. Runs after every render — checking the
   // flags in the render body and scheduling a render there is a render-phase side
   // effect, which is structurally unsound; doing it in an effect is the safe path.
   useEffect(() => {
-    if (_smcDirty) {
-      _smcDirty = false;
-      forceUpdate(n => n + 1);
-    }
-    if (_ytmDirty) {
-      _ytmDirty = false;
-      forceUpdate(n => n + 1);
-    }
-  });
+    const interval = setInterval(() => {
+      if (_smcDirty) {
+        _smcDirty = false;
+        forceUpdate(n => n + 1);
+      }
+      if (_ytmDirty) {
+        _ytmDirty = false;
+        forceUpdate(n => n + 1);
+      }
+    }, 500);
+    return () => clearInterval(interval);
+  }, []);
 
   // Read directly from module-level state — always current
   const selectedSpeakers = _smcSpeakers;
@@ -3003,7 +3030,14 @@ function SonosMusicApp({ hass, config }) {
 
   // Service toggle — mirror into module state so the views read it consistently,
   // and into React state so the panels re-render/re-fetch.
-  const setService = useCallback((s) => { _smcService = s; setServiceState(s); scheduleStateSave(); }, []);
+  const setService = useCallback((s) => {
+    _smcService = s;
+    setServiceState(s);
+    scheduleStateSave();
+    // Sonos has no card-side Queue tab; if the user switches to Sonos while on it,
+    // fall back to Browse so they don't land on a now-hidden tab.
+    if (s === 'sonos' && activeTab === 'queue') setActiveTab('browse');
+  }, [activeTab]);
 
   // One-at-a-time toast: shown, then auto-dismissed after 1.8s (the CSS animation
   // handles the fade; unmounting at the same time keeps only one toast alive).
@@ -3032,7 +3066,7 @@ function SonosMusicApp({ hass, config }) {
       ${(activeTab === 'search' || activeTab === 'browse') && html`
         <${ServiceBar} service=${service} onService=${setService} />
       `}
-      <${BottomNav} activeTab=${activeTab} onTabChange=${setActiveTab} />
+      <${BottomNav} activeTab=${activeTab} onTabChange=${setActiveTab} service=${service} />
 
       <div class=${`smc-tab-panel${jfSearchVisible ? '' : ' hidden'}`}>
         <${SearchView} hass=${hass} selectedSpeakers=${selectedSpeakers}
