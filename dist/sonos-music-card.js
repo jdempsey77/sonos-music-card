@@ -1,4 +1,4 @@
-// Sonos Music Card v0.22.1
+// Sonos Music Card v0.22.2
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -120,6 +120,9 @@
 // media_channel as the Now Playing title instead of media_title — SXM injects
 // sponsor/ad text into this channel's broadcast metadata stream during songs.
 // Scoped to sid=37 / c3890f3c only; all other SXM channels show live metadata.
+// v0.22.2: narrow Road Trip Radio detection to UUID c3890f3c only — sid=37
+// matched multiple SiriusXM channels, making all SXM stations show the channel
+// name instead of live song metadata. The UUID uniquely identifies the channel.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -1348,7 +1351,7 @@ function buildNpInfo(id, state, service = _smcService) {
     // Road Trip Radio (CH 301, sid=37) injects sponsor/ad text into
     // media_title during song playback via the broadcast metadata stream.
     // Use media_channel (stable channel name) as the title instead.
-    const isRoadTripRadio = cid.includes('sid=37') || cid.includes('c3890f3c');
+    const isRoadTripRadio = cid.includes('c3890f3c');
     if (isRoadTripRadio && a.media_channel) {
       info.title = a.media_channel;
       info.artist = '';
