@@ -1,4 +1,4 @@
-// Sonos Music Card v0.21.6
+// Sonos Music Card v0.21.7
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -113,6 +113,13 @@ let _smcConfig = {};
 // 'jf' = Jellyfin, 'ytm' = YouTube Music, 'sonos' = Sonos favorites (v0.21.0).
 // Toggled by the ServiceBar.
 let _smcService = 'jf';
+
+// Speaker most recently started by the card (Sonos favorite or explicit play).
+// getNowPlaying checks this first so Now Playing pins to the launch speaker
+// instead of resolving via the media-context heuristic, which could latch onto a
+// different speaker still paused on stale metadata. Cleared when JF/YTM takes
+// over and on genuine idle (the stale-art useEffect).
+let _smcPinnedEntityId = null;
 
 // ── Jellyfin config + client ────────────────────────────────────
 let _jellyfinUrl = null;          // public, browser-facing (browse + images)
@@ -354,6 +361,7 @@ async function playJfTracks(hass, eid, tracks, startIndex = 0) {
   _ytmDirty = true;
   _ytmQueue = [];
   _ytmQueueEntityId = null;
+  _smcPinnedEntityId = null;    // Jellyfin takes over — drop the Sonos pin
   const slice = tracks.slice(startIndex);
   const ids = slice.map(t => t.id);
   try {
@@ -502,6 +510,7 @@ async function playYtmTrack(hass, eid, videoId, meta = {}, queue = null) {
   _smcLastFetchedArtId = null;
   _smcQueue = [];              // different source — drop Jellyfin queue
   _smcQueueEntityId = null;
+  _smcPinnedEntityId = null;   // YTM takes over — drop the Sonos pin
   try {
     await hass.callService('media_player', 'play_media', {
       entity_id: eid,
@@ -765,6 +774,7 @@ async function playSonosFavorite(hass, eid, item) {
       media_content_id: item.mediaContentId,
       media_content_type: item.mediaContentType,
     });
+    _smcPinnedEntityId = coordinator;   // pin Now Playing to the launch speaker
     scheduleStateSave();
     return true;
   } catch (err) {
@@ -777,6 +787,7 @@ async function playSonosFavorite(hass, eid, item) {
           media_content_id: item.mediaContentId,
           media_content_type: 'music',
         });
+        _smcPinnedEntityId = coordinator;   // pin Now Playing to the launch speaker
         scheduleStateSave();
         return true;
       } catch (err2) {
@@ -1282,6 +1293,16 @@ function buildNpInfo(id, state, service = _smcService) {
     repeat: a.repeat || 'off',
   };
 
+  // Sonos-native playback (favorites, SiriusXM, radio) uses x-sonos* content ids
+  // the Jellyfin art pipeline can't resolve (its /Audio/.../stream regex misses).
+  // Use HA's entity_picture directly — it carries real channel art — and skip
+  // both the YTM and Jellyfin branches, regardless of the active service.
+  const cid = a.media_content_id || '';
+  if (cid.startsWith('x-sonosapi-') || cid.startsWith('x-rincon-') || cid.startsWith('x-sonos-')) {
+    info.art = smcResolveImage(a.entity_picture) || null;
+    return info;
+  }
+
   if (service === 'ytm') {
     // YTM active: title/artist/art come from stored YTM metadata (HA reports the
     // raw stream URL as media_title). Never read Jellyfin art. The thumbnail wins
@@ -1404,12 +1425,24 @@ function getSpeakers(hass, config = _smcConfig) {
 function getNowPlaying(hass, selectedSpeakers, service = _smcService) {
   if (!hass) return null;
 
+  // Pinned speaker wins: the one most recently started by the card (Sonos
+  // favorite / explicit play). Read-only here (getNowPlaying is PURE — see the
+  // useMemo callers); the stale pin is cleared in the idle-cleanup useEffect.
+  // Without this, the heuristic below could latch onto a *different* speaker
+  // still paused on stale metadata instead of the speaker actually playing.
+  if (_smcPinnedEntityId) {
+    const pinned = hass.states[_smcPinnedEntityId];
+    if (pinned && hasMediaContext(pinned)) return buildNpInfo(_smcPinnedEntityId, pinned, service);
+  }
+
   if (service === 'ytm') {
     // No YTM track has played → nothing to show in YTM context.
     if (!_ytmNowPlaying) return null;
-    // Use a speaker with media context for transport/progress; fall back to the
-    // first selected speaker so controls still target something.
-    const id = selectedSpeakers.find(i => hass.states[i] && hasMediaContext(hass.states[i]))
+    // Prefer an actively playing speaker for transport/progress, then any with
+    // media context; fall back to the first selected speaker so controls target.
+    const id = selectedSpeakers.find(i => hass.states[i]?.state === 'playing' && hasMediaContext(hass.states[i]))
+      || getSpeakers(hass).find(i => hass.states[i]?.state === 'playing' && hasMediaContext(hass.states[i]))
+      || selectedSpeakers.find(i => hass.states[i] && hasMediaContext(hass.states[i]))
       || getSpeakers(hass).find(i => hass.states[i] && hasMediaContext(hass.states[i]))
       || selectedSpeakers[0];
     const state = id ? hass.states[id] : null;
@@ -1417,14 +1450,25 @@ function getNowPlaying(hass, selectedSpeakers, service = _smcService) {
     return buildNpInfo(id, state, 'ytm');
   }
 
-  // Jellyfin context — selected speakers first, then any configured speaker.
+  // Pass 1: prefer an actively PLAYING speaker over a paused one — never let a
+  // speaker paused on stale metadata beat one that is actually playing.
   for (const id of selectedSpeakers) {
     const state = hass.states[id];
-    if (state && hasMediaContext(state)) return buildNpInfo(id, state, 'jf');
+    if (state?.state === 'playing' && hasMediaContext(state)) return buildNpInfo(id, state, service);
   }
   for (const id of getSpeakers(hass)) {
     const state = hass.states[id];
-    if (state && hasMediaContext(state)) return buildNpInfo(id, state, 'jf');
+    if (state?.state === 'playing' && hasMediaContext(state)) return buildNpInfo(id, state, service);
+  }
+
+  // Pass 2: fall back to paused/idle-with-context (selected first, then any).
+  for (const id of selectedSpeakers) {
+    const state = hass.states[id];
+    if (state && hasMediaContext(state)) return buildNpInfo(id, state, service);
+  }
+  for (const id of getSpeakers(hass)) {
+    const state = hass.states[id];
+    if (state && hasMediaContext(state)) return buildNpInfo(id, state, service);
   }
   // Nothing playing/paused anywhere. getNowPlaying is PURE (called from three
   // useMemos) — it does NOT clear the stored Jellyfin art ids here. That stale-art
@@ -1460,6 +1504,7 @@ async function ytmAdjacent(hass, entityId, delta) {
     await hass.callService('media_player', 'play_media', {
       entity_id: entityId, media_content_id: url, media_content_type: 'music',
     });
+    _smcPinnedEntityId = entityId;
     scheduleStateSave();
   } catch (err) { console.error('[smc] YTM transport failed:', err); }
 }
@@ -1475,6 +1520,7 @@ async function jfAdjacent(hass, entityId, delta) {
     });
     _smcNowPlayingJfId = track.id;
     _smcNowPlayingJfAlbumId = track.albumId || null;
+    _smcPinnedEntityId = entityId;
     scheduleStateSave();
   } catch (err) { console.error('[smc] JF transport failed:', err); }
 }
@@ -3045,6 +3091,7 @@ function SonosMusicApp({ hass, config }) {
   // the Jellyfin service so switching to YTM (where nowPlaying is null until a YTM
   // track plays) doesn't wipe a still-valid Jellyfin art id.
   useEffect(() => {
+    if (!nowPlaying) _smcPinnedEntityId = null;   // nothing anywhere — drop stale pin
     if (service !== 'ytm' && !nowPlaying && _smcNowPlayingJfId) {
       _smcNowPlayingJfId = null;
       _smcNowPlayingJfAlbumId = null;
