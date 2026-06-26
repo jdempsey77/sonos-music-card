@@ -1,4 +1,4 @@
-// Sonos Music Card v0.21.4
+// Sonos Music Card v0.21.5
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -741,12 +741,27 @@ async function sonosFetchFavorites(hass, entityId) {
 // stale art from the previous service. Returns true on success.
 async function playSonosFavorite(hass, eid, item) {
   if (!hass || !eid || !item) return false;
+
+  // Resolve the actual Sonos coordinator — play_media must target the group
+  // coordinator, not a follower (402 Invalid Args otherwise). HA reports
+  // group_members on the coordinator (members[0] is the coordinator); find
+  // which speaker in the group owns eid as a member.
+  let coordinator = eid;
+  const allSpeakers = getSpeakers(hass);
+  for (const id of allSpeakers) {
+    const members = hass.states[id]?.attributes?.group_members || [];
+    if (members.includes(eid) && members[0] === id) {
+      coordinator = id;
+      break;
+    }
+  }
+
   _smcNowPlayingJfId = null; _smcNowPlayingJfAlbumId = null; _smcLastFetchedArtId = null;
   _smcQueue = []; _smcQueueEntityId = null;
   _ytmNowPlaying = null; _ytmDirty = true; _ytmQueue = []; _ytmQueueEntityId = null;
   try {
     await hass.callService('media_player', 'play_media', {
-      entity_id: eid,
+      entity_id: coordinator,
       media_content_id: item.mediaContentId,
       media_content_type: item.mediaContentType,
     });
@@ -754,6 +769,20 @@ async function playSonosFavorite(hass, eid, item) {
     return true;
   } catch (err) {
     console.error('[smc] Sonos play failed:', err);
+    // Fallback: retry with 'music' content type if favorite_item_id rejected
+    if (item.mediaContentType !== 'music') {
+      try {
+        await hass.callService('media_player', 'play_media', {
+          entity_id: coordinator,
+          media_content_id: item.mediaContentId,
+          media_content_type: 'music',
+        });
+        scheduleStateSave();
+        return true;
+      } catch (err2) {
+        console.error('[smc] Sonos play fallback failed:', err2);
+      }
+    }
     return false;
   }
 }
@@ -2870,10 +2899,13 @@ function smcInit(hass) {
 function smcAutoDetect(hass) {
   const speakers = getSpeakers(hass);
 
-  // If any selected speaker is actively playing, never auto-switch. (Checked
-  // first so a playing selection short-circuits before the latch logic.)
-  const selPlaying = _smcSpeakers.some(id => hass.states[id]?.state === 'playing');
-  if (selPlaying) return;
+  // Block auto-switch if any selected speaker has media context (playing,
+  // paused, or idle-with-title) — not just 'playing'. Radio stations can
+  // briefly report idle between tracks which would otherwise release this
+  // guard and trigger oscillation. (Checked first so an active selection
+  // short-circuits before the latch logic.)
+  const selActive = _smcSpeakers.some(id => hasMediaContext(hass.states[id]));
+  if (selActive) return;
 
   // Respect the latch: after any user tap OR a prior auto-detect promotion,
   // block re-evaluation for 30s, then release only if the selection has gone
