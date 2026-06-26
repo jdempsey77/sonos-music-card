@@ -271,6 +271,12 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.22.1** — **Road Trip Radio metadata fix.** Road Trip Radio (CH 301, SiriusXM
+`sid=37` / UUID `c3890f3c`) shows `media_channel` as the Now Playing title instead of
+`media_title` — SXM injects sponsor/ad text into this channel's broadcast metadata
+stream during songs. Scoped to `sid=37` / `c3890f3c` only (in `buildNpInfo`'s
+Sonos-native branch); all other SXM channels keep showing live metadata.
+
 **v0.22.0** — **Precision fix pass (8 fixes, no architectural overhaul).**
 1. **Group-on-play (BUG-4).** New shared `ensureGroup(hass, selectedSpeakers)` helper
    issues a single `media_player.join` (primary = `selectedSpeakers[0]` as coordinator)
