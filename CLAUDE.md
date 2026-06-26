@@ -168,7 +168,8 @@ let _haStateSaveTimer = null // debounce timer for ytm-service /state save (v0.2
 | `loadStateFromHA()` / `scheduleStateSave()` / `buildStateBlob()` | Cross-device state (v0.20.0; backend switched to ytm-service in v0.20.1). Persist `service` + both queues + now-playing ids to ytm-service `GET/POST ${ytm_url}/state` (SQLite-backed on ska); load on init. Save debounced 2s, called at every queue/service/now-playing mutation. The POST is a CORS **simple request** (no `Content-Type` header → `text/plain`) to skip the preflight nginx would reject; server parses with `get_json(force=True)`. Silent in-memory fallback if the endpoint is unreachable. (The name `loadStateFromHA` is retained for continuity; the backend is no longer HA — its WS `frontend/*_user_data` API is absent in this build.) |
 | `jfFetchTrackAlbumInfo(trackId)` | (v0.20.0, replaces `jfFetchImageTag`) Fetch `AlbumId` + `AlbumPrimaryImageTag` for a track in one `/Items?Ids=…&Fields=…` call — used to resolve **album** art for auto-detected tracks, since most tracks have no track-level image |
 | `smcToggleSpeaker(entityId, hass)` | Chip toggle = group membership (clean on/off, v0.19.0). Add → simple `join` to the active coordinator if something's playing, else just select; remove → `unjoin` (stops). Removing the **last** speaker is playback-conditional (v0.19.5): if it's playing, `media_stop` first, then deselect to zero; if idle, just deselect to zero. Async; `_smcSpeakers` mutates synchronously for optimistic UI. Sets `_smcUserSelected = true` |
-| `transportPlayPause/Next/Prev(hass, entityId)` | Shared transport (v0.19.0) used by both BottomBar and NowPlayingView. Play/pause → HA `media_play_pause`. Next/prev resolve the adjacent queue track card-side and `play_media` it when the active service has a card-side queue — YTM via `ytmAdjacent`/`_ytmQueue`, Jellyfin via `jfAdjacent`/`_smcQueue` (v0.19.1; HA `media_next_track` no-ops on native Sonos entities queued via `play_media`). Falls back to HA `media_*` services when the queue is empty |
+| `transportPlayPause/Next/Prev(hass, entityId)` | Shared transport (v0.19.0) used by both BottomBar and NowPlayingView. Play/pause → HA `media_play_pause`. Next/prev resolve the adjacent queue track card-side and `play_media` it when the active service has a card-side queue — YTM via `ytmAdjacent`/`_ytmQueue`, Jellyfin via `jfAdjacent`/`_smcQueue` (v0.19.1; HA `media_next_track` no-ops on native Sonos entities queued via `play_media`). `jfAdjacent` reconciles `_smcNowPlayingJfId` against the speaker's live `media_content_id` before indexing (v0.22.0) so a natural queue advance doesn't make Next replay track 0. Falls back to HA `media_*` services when the queue is empty |
+| `ensureGroup(hass, selectedSpeakers)` | (v0.22.0) Awaited at the start of every play path (`playJfTracks`/`playYtmTrack`/`playSonosFavorite`). Joins all selected speakers under `selectedSpeakers[0]` as coordinator (single `media_player.join` + 500ms settle) so multi-room plays group even from idle. No-op for a single speaker |
 | `hasMediaContext(state)` | True if playing, paused, or idle+title+mid-track |
 | `isExternalSource(state)` | True if playing from a non-queue source (TV, line-in) |
 | `getNowPlaying(hass, selected, service)` | Now-playing scoped to the active service (`_smcService`): YTM context = stored `_ytmNowPlaying`; Jellyfin context = live HA state. No cross-read |
@@ -270,6 +271,43 @@ Limitation: a natural queue advance on the speaker isn't observed, so the
 "currently playing" highlight falls back to matching the now-playing title.
 
 ## Current version
+**v0.22.0** — **Precision fix pass (8 fixes, no architectural overhaul).**
+1. **Group-on-play (BUG-4).** New shared `ensureGroup(hass, selectedSpeakers)` helper
+   issues a single `media_player.join` (primary = `selectedSpeakers[0]` as coordinator)
+   plus a 500ms settle delay, and is awaited at the **start of every play path** —
+   `playJfTracks`, `playYtmTrack`, `playSonosFavorite`. Previously multi-room only
+   grouped if something was already playing, so playing from **idle** left audio on
+   `selectedSpeakers[0]` alone. Now multi-room always means multi-room. No-op for a
+   single selected speaker.
+2. **Next/prev reconcile (BUG-5).** `jfAdjacent` now reconciles `_smcNowPlayingJfId`
+   against the speaker's live `media_content_id` (`/Audio/{id}/stream` regex) before
+   computing the next/prev index. A natural Sonos queue advance updates the live
+   content id but not the card-side id, so `findIndex` returned -1 and Next replayed
+   track 0; the reconcile fixes that.
+3. **`_smcPinnedEntityId` → `_smcLaunchHint` (BUG-1/2/3).** The old pin was checked
+   first in `getNowPlaying` and only required `hasMediaContext` (true for paused), so
+   a pinned-paused speaker could beat an actively playing one, and it was checked
+   before the service branch (violating service isolation). Replaced with a bounded
+   `_smcLaunchHint = {entityId, ts}`: honored **only if < 10s old AND the speaker is
+   `state==='playing'`**; otherwise it's cleared and control falls through to the
+   two-pass (playing → paused) scan. Session-only — never persisted in the state blob.
+4. **Sonos Search tab hidden (UX).** Search joins Queue in being gated out of
+   `BottomNav` when `_smcService==='sonos'` (favorites have no search); `setService`
+   redirects Search→Browse when switching to Sonos, mirroring the Queue redirect.
+5. **Hero art 320px (BUG-9).** `jfImageUrl(itemId, tag, size=96)` takes an optional
+   size; the Now Playing hero (`buildNpInfo` queue/album art sources) requests 320px
+   instead of an upscaled 96px. Browse thumbnails keep 96.
+6. **referrerpolicy (BUG-10).** `referrerpolicy="no-referrer"` added to the
+   NowPlayingView hero `<img>` (the BottomBar art already had it).
+7. **Per-entity volume debounce (BUG-11).** The single module-level
+   `_volumeDebounceTimer` is now a `_volumeDebounceTimers` **Map keyed by entity id**,
+   so rapid adjustments on two speakers no longer cancel each other's pending
+   `volume_set`.
+8. **Radio progress bar suppressed (BUG-12).** The progress bar + timestamps are now
+   wrapped in a `duration > 0` guard in both `NowPlayingView` and `BottomBar`, so a
+   radio stream (duration=0) shows nothing instead of a stuck 0:00 / ever-growing
+   counter.
+
 **v0.21.7** — **Now Playing pins to the launch speaker + prefers playing over paused.** Playing a Sonos favorite (e.g. a SiriusXM station) could show a *different* speaker's track/artist/art. `getNowPlaying` picked the display speaker via a media-context scan that ranked a `paused` speaker (holding stale Jellyfin metadata) equal to one actually `playing`, so a paused speaker could win. Three fixes: **(a)** `_smcPinnedEntityId` — `playSonosFavorite` (and `jfAdjacent`/`ytmAdjacent`) pin the launch/coordinator speaker, and `getNowPlaying` returns it first; cleared when JF/YTM playback takes over and on genuine idle (the stale-art `useEffect`). **(b)** `getNowPlaying` is now a **two-pass** scan — actively `playing` speakers first, then paused/idle-with-context as fallback — so a stale paused speaker can never beat one that is playing. **(c)** `buildNpInfo` detects Sonos-native content ids (`x-sonosapi-` / `x-rincon-` / `x-sonos-`) and uses HA `entity_picture` directly, bypassing the Jellyfin art pipeline (whose `/Audio/.../stream` regex never matches a Sonos stream).
 
 **v0.21.6** — **favorites_folder drilling fix.** The favorites loop skipped `favorites_folder` nodes (Radio, Playlists) because they report `can_expand: false` and `can_play: false`, even though their children are reachable via an explicit `sonosBrowse` fetch. The guard now also lets `media_content_type === 'favorites_folder'` through, so the explicit fetch runs and surfaces their contents — SiriusXM stations in the Radio folder now appear.
@@ -645,6 +683,14 @@ browser; there is no ska component, no nginx route, no auth beyond HA.
 - [x] Artist/album "Play all" affordance in Browse — v0.15.0 (Play All + Add All)
 - [x] YouTube Music support — v0.16.0 (ytm-service on ska; search + stream via yt-dlp)
 - [x] Sonos favorites support — v0.21.0 (browse_media tree, play_media favorite_item_id)
+- [x] Group-on-play from idle (multi-room only grouped if already playing) — v0.22.0 (`ensureGroup`)
+- [x] Next replaying track 0 after natural Sonos queue advance — v0.22.0 (`jfAdjacent` reconcile)
+- [x] Pinned-paused speaker beating a playing one in Now Playing — v0.22.0 (`_smcLaunchHint`, bounded 10s + playing-only)
+- [x] Sonos Search tab dead placeholder — v0.22.0 (hidden like Queue)
+- [x] Now Playing hero art upscaled from 96px — v0.22.0 (`jfImageUrl` size param, 320px hero)
+- [x] Per-speaker volume debounce (single timer canceled cross-speaker) — v0.22.0 (Map keyed by entity)
+- [x] Broken progress bar for radio (duration=0) — v0.22.0 (duration guard)
+- [ ] Cross-device state blob now-playing reconcile (BUG-6, deferred to v0.23.0)
 - [ ] "Shuffle" affordance for Play All / Add All
 - [ ] Queue reorder / delete (Queue tab is read-only this version)
 - [ ] Art that tracks queue advance (currently shows first track's art only)

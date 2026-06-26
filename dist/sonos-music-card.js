@@ -1,4 +1,4 @@
-// Sonos Music Card v0.21.7
+// Sonos Music Card v0.22.0
 // Preact + htm, no build step — Custom HA Lovelace card for Sonos.
 // Control/transport via native HA media_player services; media browsing via
 // Jellyfin API (direct HTTP from the card); playback via HA play_media of a
@@ -99,6 +99,23 @@
 // _smcSetService ref lets loadStateFromHA sync the React service state immediately
 // on restore. (c) Queue tab hidden when Sonos is active (Sonos owns its queue);
 // switching to Sonos while on Queue auto-redirects to Browse.
+// v0.22.0: precision fix pass (8 fixes, no architectural change).
+// (1) ensureGroup() runs before EVERY play (playJfTracks/playYtmTrack/
+// playSonosFavorite) — multi-room from idle now always joins all selected speakers
+// under selectedSpeakers[0] before play_media, so multi-room means multi-room even
+// when nothing was playing. (2) jfAdjacent reconciles _smcNowPlayingJfId against the
+// speaker's live media_content_id before computing next/prev — fixes Next replaying
+// track 0 after a natural Sonos queue advance. (3) _smcPinnedEntityId replaced with
+// _smcLaunchHint {entityId, ts}: honored for max 10s AND only while that speaker is
+// state=playing, so it can't beat a different playing speaker and falls through to
+// the two-pass scan when expired/paused; session-only, never persisted. (4) Sonos
+// Search tab hidden (like Queue) — favorites have no search; switching to Sonos off
+// Search redirects to Browse. (5) jfImageUrl takes an optional size param; the Now
+// Playing hero requests 320px instead of upscaled 96px (Browse thumbs stay 96).
+// (6) referrerpolicy=no-referrer on the NowPlaying hero img. (7) volume debounce
+// keyed per entity (Map) so rapid two-speaker adjustments don't cancel each other.
+// (8) progress bar + timestamps suppressed when duration=0 (radio streams) in both
+// NowPlayingView and the BottomBar.
 
 import { h, render } from 'https://esm.sh/preact@10';
 import { useState, useEffect, useCallback, useMemo, useRef } from 'https://esm.sh/preact@10/hooks';
@@ -114,12 +131,14 @@ let _smcConfig = {};
 // Toggled by the ServiceBar.
 let _smcService = 'jf';
 
-// Speaker most recently started by the card (Sonos favorite or explicit play).
-// getNowPlaying checks this first so Now Playing pins to the launch speaker
-// instead of resolving via the media-context heuristic, which could latch onto a
-// different speaker still paused on stale metadata. Cleared when JF/YTM takes
-// over and on genuine idle (the stale-art useEffect).
-let _smcPinnedEntityId = null;
+// Bounded launch hint: the speaker most recently started by the card (Sonos
+// favorite or explicit play), {entityId, ts}. getNowPlaying honors it for at most
+// 10s AND only while that speaker is actively playing — so it nudges Now Playing
+// toward the just-launched speaker without ever overriding a different speaker
+// that is genuinely playing (the two-pass scan handles that). Session-only:
+// never persisted. Cleared when expired, when the speaker isn't playing, and on
+// genuine idle (the stale-art useEffect).
+let _smcLaunchHint = null; // {entityId, timestamp} — honored max 10s AND only when playing
 
 // ── Jellyfin config + client ────────────────────────────────────
 let _jellyfinUrl = null;          // public, browser-facing (browse + images)
@@ -224,9 +243,9 @@ async function jfCreatePlaylist(name, trackIds) {
 // Primary image (public endpoint — no token required). Uses maxHeight/maxWidth
 // (not fillHeight/fillWidth) so Jellyfin returns art gracefully for items whose
 // stored thumbnail isn't at the requested size, instead of 404ing.
-function jfImageUrl(itemId, tag) {
+function jfImageUrl(itemId, tag, size = 96) {
   if (!_jellyfinUrl || !itemId) return null;
-  let u = `${_jellyfinUrl}/Items/${itemId}/Images/Primary?maxHeight=96&maxWidth=96&quality=90`;
+  let u = `${_jellyfinUrl}/Items/${itemId}/Images/Primary?maxHeight=${size}&maxWidth=${size}&quality=90`;
   if (tag) u += `&tag=${encodeURIComponent(tag)}`;
   return u;
 }
@@ -350,6 +369,24 @@ function toQueueItem(t) {
   return { id: t.id, name: t.name, subtitle: t.subtitle || '', imageTag: t.imageTag || null, albumId: t.albumId || null };
 }
 
+// Ensure all selected speakers are grouped under selectedSpeakers[0] as
+// coordinator before playing. No-op if only one speaker selected.
+// Called by every play function so multi-room always means multi-room.
+async function ensureGroup(hass, selectedSpeakers) {
+  if (!hass || selectedSpeakers.length < 2) return;
+  const primary = selectedSpeakers[0];
+  try {
+    await hass.callService('media_player', 'join', {
+      entity_id: primary,
+      group_members: selectedSpeakers,
+    });
+    // Brief delay for Sonos group to stabilize before play_media
+    await new Promise(r => setTimeout(r, 500));
+  } catch (err) {
+    console.warn('[smc] ensureGroup failed:', err);
+  }
+}
+
 // Play a list of Jellyfin tracks from startIndex via HA. `tracks` is an array of
 // {id, name, subtitle, imageTag}. The first track replaces the queue; the rest
 // are appended best-effort (Sonos supports enqueue=add). Sets _smcNowPlayingJfId
@@ -361,7 +398,8 @@ async function playJfTracks(hass, eid, tracks, startIndex = 0) {
   _ytmDirty = true;
   _ytmQueue = [];
   _ytmQueueEntityId = null;
-  _smcPinnedEntityId = null;    // Jellyfin takes over — drop the Sonos pin
+  _smcLaunchHint = null;        // Jellyfin takes over — drop the launch hint
+  await ensureGroup(hass, _smcSpeakers);  // multi-room: group before play
   const slice = tracks.slice(startIndex);
   const ids = slice.map(t => t.id);
   try {
@@ -510,7 +548,8 @@ async function playYtmTrack(hass, eid, videoId, meta = {}, queue = null) {
   _smcLastFetchedArtId = null;
   _smcQueue = [];              // different source — drop Jellyfin queue
   _smcQueueEntityId = null;
-  _smcPinnedEntityId = null;   // YTM takes over — drop the Sonos pin
+  _smcLaunchHint = null;       // YTM takes over — drop the launch hint
+  await ensureGroup(hass, _smcSpeakers);  // multi-room: group before play
   try {
     await hass.callService('media_player', 'play_media', {
       entity_id: eid,
@@ -751,6 +790,8 @@ async function sonosFetchFavorites(hass, entityId) {
 async function playSonosFavorite(hass, eid, item) {
   if (!hass || !eid || !item) return false;
 
+  await ensureGroup(hass, _smcSpeakers);  // multi-room: group before play
+
   // Resolve the actual Sonos coordinator — play_media must target the group
   // coordinator, not a follower (402 Invalid Args otherwise). HA reports
   // group_members on the coordinator (members[0] is the coordinator); find
@@ -774,7 +815,7 @@ async function playSonosFavorite(hass, eid, item) {
       media_content_id: item.mediaContentId,
       media_content_type: item.mediaContentType,
     });
-    _smcPinnedEntityId = coordinator;   // pin Now Playing to the launch speaker
+    _smcLaunchHint = { entityId: coordinator, ts: Date.now() };   // hint Now Playing toward the launch speaker
     scheduleStateSave();
     return true;
   } catch (err) {
@@ -787,7 +828,7 @@ async function playSonosFavorite(hass, eid, item) {
           media_content_id: item.mediaContentId,
           media_content_type: 'music',
         });
-        _smcPinnedEntityId = coordinator;   // pin Now Playing to the launch speaker
+        _smcLaunchHint = { entityId: coordinator, ts: Date.now() };   // hint Now Playing toward the launch speaker
         scheduleStateSave();
         return true;
       } catch (err2) {
@@ -1320,15 +1361,15 @@ function buildNpInfo(id, state, service = _smcService) {
     if (!info.art && _smcNowPlayingJfId) {
       const qtrack = _smcQueue.find(t => t.id === _smcNowPlayingJfId);
       if (qtrack?.imageTag) {
-        info.art = jfImageUrl(_smcNowPlayingJfId, qtrack.imageTag);
+        info.art = jfImageUrl(_smcNowPlayingJfId, qtrack.imageTag, 320);
       } else if (qtrack?.albumId) {
-        info.art = jfImageUrl(qtrack.albumId, null);
+        info.art = jfImageUrl(qtrack.albumId, null, 320);
       }
     }
 
     // 2. Known album id (set when the card plays a track) → album art via jfImageUrl.
     if (!info.art && _smcNowPlayingJfAlbumId) {
-      info.art = jfImageUrl(_smcNowPlayingJfAlbumId, null);
+      info.art = jfImageUrl(_smcNowPlayingJfAlbumId, null, 320);
     }
 
     // 3. Auto-detected track (not played from the card): extract the track id from
@@ -1425,15 +1466,18 @@ function getSpeakers(hass, config = _smcConfig) {
 function getNowPlaying(hass, selectedSpeakers, service = _smcService) {
   if (!hass) return null;
 
-  // Pinned speaker wins: the one most recently started by the card (Sonos
-  // favorite / explicit play). Read-only here (getNowPlaying is PURE — see the
-  // useMemo callers); the stale pin is cleared in the idle-cleanup useEffect.
-  // Without this, the heuristic below could latch onto a *different* speaker
-  // still paused on stale metadata instead of the speaker actually playing.
-  if (_smcPinnedEntityId) {
-    const pinned = hass.states[_smcPinnedEntityId];
-    if (pinned && hasMediaContext(pinned)) return buildNpInfo(_smcPinnedEntityId, pinned, service);
+  // Bounded launch hint: honored only if < 10s old AND speaker is actively playing.
+  // Does NOT override a different playing speaker — the two-pass scan handles that.
+  if (_smcLaunchHint) {
+    const age = Date.now() - _smcLaunchHint.ts;
+    const hintState = hass.states[_smcLaunchHint.entityId];
+    if (age < 10000 && hintState?.state === 'playing') {
+      return buildNpInfo(_smcLaunchHint.entityId, hintState, service);
+    }
+    // Hint expired or speaker not playing — clear it
+    _smcLaunchHint = null;
   }
+  // Then proceed with Pass 1 (playing) + Pass 2 (paused) scan…
 
   if (service === 'ytm') {
     // No YTM track has played → nothing to show in YTM context.
@@ -1504,11 +1548,19 @@ async function ytmAdjacent(hass, entityId, delta) {
     await hass.callService('media_player', 'play_media', {
       entity_id: entityId, media_content_id: url, media_content_type: 'music',
     });
-    _smcPinnedEntityId = entityId;
+    _smcLaunchHint = { entityId, ts: Date.now() };
     scheduleStateSave();
   } catch (err) { console.error('[smc] YTM transport failed:', err); }
 }
 async function jfAdjacent(hass, entityId, delta) {
+  // Reconcile card-side now-playing id against what the speaker actually reports.
+  // Natural Sonos advance updates media_content_id but not _smcNowPlayingJfId.
+  const liveContentId = hass?.states[entityId]?.attributes?.media_content_id || '';
+  const liveMatch = liveContentId.match(/\/Audio\/([a-f0-9-]+)\/stream/i);
+  if (liveMatch && liveMatch[1] !== _smcNowPlayingJfId) {
+    _smcNowPlayingJfId = liveMatch[1];
+  }
+
   const i = _smcQueue.findIndex(t => t.id === _smcNowPlayingJfId);
   const track = _smcQueue[i + delta];
   if (!track) return;
@@ -1520,7 +1572,7 @@ async function jfAdjacent(hass, entityId, delta) {
     });
     _smcNowPlayingJfId = track.id;
     _smcNowPlayingJfAlbumId = track.albumId || null;
-    _smcPinnedEntityId = entityId;
+    _smcLaunchHint = { entityId, ts: Date.now() };
     scheduleStateSave();
   } catch (err) { console.error('[smc] JF transport failed:', err); }
 }
@@ -2538,11 +2590,12 @@ function QueueView({ hass, selectedSpeakers, onTabChange, service, onToast }) {
   `;
 }
 
-// Debounce timer for the volume sliders — dragging a slider fires onInput on
-// every pixel, which would flood HA with volume_set calls. Module-level so it
-// survives re-renders; coalesces rapid changes into one call 300ms after the
-// last drag event.
-let _volumeDebounceTimer = null;
+// Debounce timers for the volume sliders — dragging a slider fires onInput on
+// every pixel, which would flood HA with volume_set calls. Keyed by entity id
+// (a single shared timer would let rapid adjustments on two speakers cancel each
+// other) and module-level so they survive re-renders; coalesces rapid changes
+// into one call 300ms after the last drag event per speaker.
+let _volumeDebounceTimers = new Map();
 
 // ── Now Playing View ────────────────────────────────────────────
 function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
@@ -2605,16 +2658,19 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
   const handleVolume = useCallback((speakerId, value) => {
     const h = hassRef.current;
     if (!h) return;
-    // Debounce: coalesce a drag's flood of onInput events into one volume_set
-    // 300ms after the last change.
-    if (_volumeDebounceTimer) clearTimeout(_volumeDebounceTimer);
-    _volumeDebounceTimer = setTimeout(() => {
+    // Debounce per speaker: coalesce a drag's flood of onInput events into one
+    // volume_set 300ms after the last change. Keyed by entity id so adjusting two
+    // speakers in quick succession doesn't cancel each other's pending call.
+    if (_volumeDebounceTimers.has(speakerId)) {
+      clearTimeout(_volumeDebounceTimers.get(speakerId));
+    }
+    _volumeDebounceTimers.set(speakerId, setTimeout(() => {
       h.callService('media_player', 'volume_set', {
         entity_id: speakerId,
         volume_level: value / 100,
       });
-      _volumeDebounceTimer = null;
-    }, 300);
+      _volumeDebounceTimers.delete(speakerId);
+    }, 300));
   }, []);
 
   // Volume sliders follow the CARD's selection (_smcSpeakers), not the HA/Sonos
@@ -2658,6 +2714,7 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
            buildNpInfo before render; onError just flips state to the placeholder. -->
       ${np.art && !artError
         ? html`<img class="np-art-square" src=${np.art} alt="" loading="eager"
+            referrerpolicy="no-referrer"
             onError=${() => setArtError(true)} />`
         : html`<div class="np-art-square-placeholder"><${IconMusicNote} /></div>`
       }
@@ -2668,18 +2725,20 @@ function NowPlayingView({ hass, selectedSpeakers, onTabChange, service }) {
         ${np.artist && html`<p class="np-artist">${np.artist}</p>`}
       </div>
 
-      <!-- Progress bar -->
-      <div class="np-progress">
-        <div class="np-progress-bar" onClick=${handleSeek}>
-          <div class="np-progress-fill" style=${`width: ${progress * 100}%`}>
-            <div class="np-progress-dot" />
+      <!-- Progress bar (suppressed for radio/streams that report duration=0) -->
+      ${np.duration > 0 && html`
+        <div class="np-progress">
+          <div class="np-progress-bar" onClick=${handleSeek}>
+            <div class="np-progress-fill" style=${`width: ${progress * 100}%`}>
+              <div class="np-progress-dot" />
+            </div>
+          </div>
+          <div class="np-progress-times">
+            <span>${formatTime(currentPos)}</span>
+            <span>${formatTime(np.duration)}</span>
           </div>
         </div>
-        <div class="np-progress-times">
-          <span>${formatTime(currentPos)}</span>
-          <span>${formatTime(np.duration)}</span>
-        </div>
-      </div>
+      `}
 
       <!-- Shuffle / repeat (transport play/prev/next live in the BottomBar) -->
       ${np.isExternal ? html`
@@ -2783,17 +2842,19 @@ function BottomBar({ nowPlaying, hass, onTap }) {
         </button>
         <button class="smc-bb-btn" onClick=${onNext}><${IconNext} /></button>
       </div>
-      <div class="smc-bb-progress">
-        <div class="smc-bb-progress-bar">
-          <div class="smc-bb-progress-fill" style=${`width: ${progress * 100}%`}>
-            <div class="smc-bb-progress-dot"></div>
+      ${np?.duration > 0 && html`
+        <div class="smc-bb-progress">
+          <div class="smc-bb-progress-bar">
+            <div class="smc-bb-progress-fill" style=${`width: ${progress * 100}%`}>
+              <div class="smc-bb-progress-dot"></div>
+            </div>
+          </div>
+          <div class="smc-bb-progress-times">
+            <span>${formatTime(currentPos)}</span>
+            <span>${formatTime(np.duration)}</span>
           </div>
         </div>
-        <div class="smc-bb-progress-times">
-          <span>${formatTime(currentPos)}</span>
-          <span>${formatTime(np?.duration || 0)}</span>
-        </div>
-      </div>
+      `}
     </div>
   `;
 }
@@ -2801,7 +2862,8 @@ function BottomBar({ nowPlaying, hass, onTap }) {
 // ── Bottom Nav ──────────────────────────────────────────────────
 function BottomNav({ activeTab, onTabChange, service }) {
   const tabs = [
-    { id: 'search', label: 'Search', icon: IconSearch },
+    // Sonos favorites have no search — hide Search (like Queue) for Sonos.
+    ...(service !== 'sonos' ? [{ id: 'search', label: 'Search', icon: IconSearch }] : []),
     { id: 'browse', label: 'Browse', icon: IconBrowse },
     // Sonos manages its own queue — the Queue tab is meaningless there, so hide it.
     ...(service !== 'sonos' ? [{ id: 'queue', label: 'Queue', icon: IconQueue }] : []),
@@ -3091,7 +3153,7 @@ function SonosMusicApp({ hass, config }) {
   // the Jellyfin service so switching to YTM (where nowPlaying is null until a YTM
   // track plays) doesn't wipe a still-valid Jellyfin art id.
   useEffect(() => {
-    if (!nowPlaying) _smcPinnedEntityId = null;   // nothing anywhere — drop stale pin
+    if (!nowPlaying) _smcLaunchHint = null;   // nothing anywhere — drop stale launch hint
     if (service !== 'ytm' && !nowPlaying && _smcNowPlayingJfId) {
       _smcNowPlayingJfId = null;
       _smcNowPlayingJfAlbumId = null;
@@ -3113,9 +3175,9 @@ function SonosMusicApp({ hass, config }) {
     _smcService = s;
     setServiceState(s);
     scheduleStateSave();
-    // Sonos has no card-side Queue tab; if the user switches to Sonos while on it,
-    // fall back to Browse so they don't land on a now-hidden tab.
-    if (s === 'sonos' && activeTab === 'queue') setActiveTab('browse');
+    // Sonos has no card-side Queue or Search tab; if the user switches to Sonos
+    // while on either, fall back to Browse so they don't land on a now-hidden tab.
+    if (s === 'sonos' && (activeTab === 'queue' || activeTab === 'search')) setActiveTab('browse');
   }, [activeTab]);
 
   // One-at-a-time toast: shown, then auto-dismissed after 1.8s (the CSS animation
