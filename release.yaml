@@ -1,16 +1,17 @@
 # release.yaml: the release contract (v1). Schema: _reorg/repo_contract_audit.md.
 # Read by /merge and /deploy (d5-dev flow/) from the default branch only. Changing this file is tier 3.
+# RETIRED (Jerry 2026-10-20): the card is no longer used. Nothing deploys; dev is not merged to main. Archive is a parked idea.
 contract: 1
 tier: 1
-branch: dev                        # GAP: GitHub's default branch is dev, but main is 50 commits ahead and is what ska runs
-test: null                         # GAP: no tests
-ci: false                          # GAP: no CI
-secrets: deploy.env                # GAP: plaintext .env in ska's checkout (HOME_ASSISTANT_TOKEN), move to sops
+branch: dev                        # GitHub's default branch (main is 50 ahead; left as-is, repo retired)
+test: null                         # retired: no tests
+ci: false                          # retired: no CI
+secrets: deploy.env                # GAP: plaintext .env in ska's checkout (HOME_ASSISTANT_TOKEN), revoke/remove when archived
 deploy:
-  target: ha-green
-  how: hand
+  target: none
+  how: none
   order: 70
-  ledger: none                     # GAP: no ledger line
-  note: "On ska: cd ~/code/sonos-music-card && ./scripts/deploy.sh (scp the card to HA Green /homeassistant/www/community/ + bump the ?v= resource), from main."
-smoke: {command: null}             # GAP: no smoke check
+  ledger: none
+  note: "retired"
+smoke: {command: null}             # retired: nothing runs
 rollback: hand
