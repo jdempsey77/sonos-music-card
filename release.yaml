@@ -1,0 +1,16 @@
+# release.yaml: the release contract (v1). Schema: _reorg/repo_contract_audit.md.
+# Read by /merge and /deploy (d5-dev flow/) from the default branch only. Changing this file is tier 3.
+contract: 1
+tier: 1
+branch: dev                        # GAP: GitHub's default branch is dev, but main is 50 commits ahead and is what ska runs
+test: null                         # GAP: no tests
+ci: false                          # GAP: no CI
+secrets: deploy.env                # GAP: plaintext .env in ska's checkout (HOME_ASSISTANT_TOKEN), move to sops
+deploy:
+  target: ha-green
+  how: hand
+  order: 70
+  ledger: none                     # GAP: no ledger line
+  note: "On ska: cd ~/code/sonos-music-card && ./scripts/deploy.sh (scp the card to HA Green /homeassistant/www/community/ + bump the ?v= resource), from main."
+smoke: {command: null}             # GAP: no smoke check
+rollback: hand
